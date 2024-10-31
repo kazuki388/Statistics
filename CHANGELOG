@@ -1,0 +1,23 @@
+## 2024-11-01
+
+### Added
+- Support for multiple event types (channels, roles, voice, etc.).
+- Role statistics tracking feature.
+- Pagination support for event logs.
+- Structured logging implemented with loguru.
+- Additional voice channel properties tracking.
+- Cleanup tasks list functionality.
+- Hash and equality methods added to InteractionRecord.
+
+### Changed
+- Replaced interaction tracking with event monitoring.
+- Modernized code structure using the MVC pattern.
+- Improved error handling and type safety.
+- Converted event handlers to async functions.
+- Improved permission overwrites handling in channel events.
+- Fixed voice state update event handling for member information.
+- Fixed color handling for role events.
+
+### Fixed
+- Fixed voice state update event handling for member information.
+- Fixed permission overwrites handling in channel events.
