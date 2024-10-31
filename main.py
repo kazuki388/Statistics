@@ -280,8 +280,7 @@ def event_handler(
 
         if not (event_class := find_event_class(event_name, _action)):
             raise ValueError(
-                f"No matching event class found for handler '{event_name}' "
-                f"with action '{_action}'"
+                f"No matching event class found for handler `{event_name}` with action `{_action}`"
             )
 
         @interactions.listen(event_class)
@@ -480,12 +479,10 @@ class Statistics(interactions.Extension):
         self.update_lock: asyncio.Lock = asyncio.Lock()
         self.stats_message: Optional[interactions.Message] = None
         self.send_semaphore: asyncio.Semaphore = asyncio.Semaphore(5)
-        asyncio.create_task(self.check_log_rotation.start())
 
     # Tasks
 
     @interactions.Task.create(interactions.IntervalTrigger(hours=1))
-    @error_handler
     async def check_log_rotation(self) -> None:
         try:
             await rotate_file(STATS_FILE_PATH)
@@ -493,7 +490,6 @@ class Statistics(interactions.Extension):
             logger.error(f"Failed to rotate files: {e}")
 
     @interactions.Task.create(interactions.IntervalTrigger(hours=12))
-    @error_handler
     async def update_interactions_daily(self) -> None:
         async with self.update_lock:
             self.timestamp_history.append(
@@ -529,7 +525,6 @@ class Statistics(interactions.Extension):
             logger.info("Role counts: %s", dict(log_data[2]))
 
     @interactions.Task.create(interactions.IntervalTrigger(hours=12))
-    @error_handler
     async def update_stats_daily(self) -> None:
         try:
             async with asyncio.timeout(30):
@@ -842,13 +837,9 @@ class Statistics(interactions.Extension):
 
     @interactions.listen(ExtensionLoad)
     async def on_load(self, event: ExtensionLoad) -> None:
-        await asyncio.wait(
-            [
-                asyncio.create_task(self.update_interactions_daily.start()),
-                asyncio.create_task(self.update_stats_daily.start()),
-                asyncio.create_task(self.check_log_rotation.start()),
-            ]
-        )
+        self.check_log_rotation.start()
+        self.update_interactions_daily.start()
+        self.update_stats_daily.start()
 
     # Event
 
@@ -923,7 +914,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Channel Created",
-            description=f"A new {channel_type.lower()} channel '{channel.name}' has been created.",
+            description=f"A new {channel_type.lower()} channel `{channel.name}` has been created.",
             color=EmbedColor.CREATE,
             fields=tuple(fields),
         )
@@ -977,7 +968,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Channel Deleted",
-            description=f"The {channel_type.lower()} channel '{channel.name}' has been permanently deleted.",
+            description=f"The {channel_type.lower()} channel `{channel.name}` has been permanently deleted.",
             color=EmbedColor.DELETE,
             fields=tuple(fields),
         )
@@ -998,7 +989,7 @@ class Statistics(interactions.Extension):
 
         if before.name != after.name:
             fields.append(
-                ("Name Change", f"From: '{before.name}'\nTo: '{after.name}'", True)
+                ("Name Change", f"From: `{before.name}`\nTo: `{after.name}`", True)
             )
 
         if before.type != after.type:
@@ -1016,7 +1007,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Category Change",
-                    f"From: '{before_category}' (ID: {before.parent_id})\nTo: '{after_category}' (ID: {after.parent_id})",
+                    f"From: `{before_category}` (ID: {before.parent_id})\nTo: `{after_category}` (ID: {after.parent_id})",
                     True,
                 )
             )
@@ -1038,7 +1029,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Topic Change",
-                    f"From: '{before.topic or 'None'}'\nTo: '{after.topic or 'None'}'",
+                    f"From: `{before.topic or 'None'}`\nTo: `{after.topic or 'None'}`",
                     False,
                 )
             )
@@ -1176,7 +1167,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Channel Updated",
-            description=f"Channel '{before.name}' has been modified with the following changes:",
+            description=f"Channel `{before.name}` has been modified with the following changes:",
             color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
@@ -1206,7 +1197,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Role Created",
-            description=f"A new role '{role.name}' has been created.",
+            description=f"A new role `{role.name}` has been created.",
             color=EmbedColor.CREATE,
             fields=tuple(fields),
         )
@@ -1257,7 +1248,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Role Deleted",
-            description=f"Role '{role.name}' has been permanently deleted.",
+            description=f"Role `{role.name}` has been permanently deleted.",
             color=EmbedColor.DELETE,
             fields=tuple(fields),
         )
@@ -1277,7 +1268,7 @@ class Statistics(interactions.Extension):
 
         if before.name != after.name:
             fields.append(
-                ("Name Change", f"From: '{before.name}'\nTo: '{after.name}'", True)
+                ("Name Change", f"From: `{before.name}`\nTo: `{after.name}`", True)
             )
 
         if before.permissions != after.permissions:
@@ -1364,7 +1355,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Role Updated",
-            description=f"Role '{before.name}' has been modified with the following changes:",
+            description=f"Role `{before.name}` has been modified with the following changes:",
             color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
@@ -1392,8 +1383,8 @@ class Statistics(interactions.Extension):
                 (
                     "Channel Change",
                     f"User {action} voice channels\n"
-                    + f"From: '{before_channel}'\n"
-                    + f"To: '{after_channel}'",
+                    + f"From: `{before_channel}`\n"
+                    + f"To: `{after_channel}`",
                     True,
                 )
             )
@@ -1525,7 +1516,7 @@ class Statistics(interactions.Extension):
 
         if before.name != after.name:
             fields.append(
-                ("Name Change", f"From: '{before.name}'\nTo: '{after.name}'", True)
+                ("Name Change", f"From: `{before.name}`\nTo: `{after.name}`", True)
             )
 
         if before.icon != after.icon:
@@ -1750,7 +1741,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Server Updated",
-            description=f"Server '{before.name}' has been modified with the following changes:",
+            description=f"Server `{before.name}` has been modified with the following changes:",
             color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
@@ -1845,7 +1836,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Server Emojis Updated",
-            description=f"The emoji list for '{event.guild.name}' has been modified.",
+            description=f"The emoji list for `{event.guild.name}` has been modified.",
             color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
@@ -2046,7 +2037,7 @@ class Statistics(interactions.Extension):
         return EventLog(
             title="Server Event Created",
             description=(
-                f"A new scheduled event '{event.scheduled_event.name}' has been created"
+                f"A new scheduled event `{event.scheduled_event.name}` has been created"
             ),
             color=EmbedColor.CREATE,
             fields=tuple(fields),
@@ -2062,7 +2053,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Name Change",
-                    f"From: '{event.before.name}'\nTo: '{event.after.name}'",
+                    f"From: `{event.before.name}`\nTo: `{event.after.name}`",
                     True,
                 )
             )
@@ -2162,7 +2153,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Server Event Updated",
-            description=(f"Scheduled event '{event.before.name}' has been modified"),
+            description=(f"Scheduled event `{event.before.name}` has been modified"),
             color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
@@ -2243,7 +2234,7 @@ class Statistics(interactions.Extension):
         return EventLog(
             title="Server Event Deleted",
             description=(
-                f"Scheduled event '{event.scheduled_event.name}' has been cancelled"
+                f"Scheduled event `{event.scheduled_event.name}` has been cancelled"
             ),
             color=EmbedColor.DELETE,
             fields=tuple(fields),
