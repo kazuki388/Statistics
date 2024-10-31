@@ -66,7 +66,7 @@ from interactions.api.events import (
     VoiceUserMute,
     WebhooksUpdate,
 )
-from interactions.ext.paginators import Paginator
+from interactions.client.errors import Forbidden, HTTPException
 from loguru import logger
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
@@ -136,6 +136,14 @@ AsyncFunc = Callable[..., T]
 class InteractionRecord:
     thread_id: int
     member_id: int
+
+    def __hash__(self) -> int:
+        return hash((self.thread_id, self.member_id))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, InteractionRecord):
+            return NotImplemented
+        return (self.thread_id, self.member_id) == (other.thread_id, other.member_id)
 
 
 @dataclass
@@ -293,10 +301,12 @@ def event_handler(
             _event_action: str = _action,
         ) -> None:
             try:
-                event_result = await func(self, event)
-                await log_event(
-                    self, f"{_event_type_name}{_event_action}", event_result
+                event_log = (
+                    await func(self, event)
+                    if inspect.iscoroutinefunction(func)
+                    else func(self, event)
                 )
+                await log_event(self, f"{_event_type_name}{_event_action}", event_log)
             except Exception as e:
                 logger.exception(
                     "Critical error in event handler %s: %s", func.__qualname__, str(e)
@@ -371,47 +381,42 @@ async def log_event(self, event_name: str, event_log: EventLog) -> None:
 
     async with event_logger(self, event_name):
         try:
-            await self.send_event_log(event_name, embed)
-        except Exception as e:
-            logger.exception("Failed to send event log: %s", str(e))
-            raise
-
-
-async def send_event_log(self, event_name: str, embed: interactions.Embed) -> None:
-    async with contextlib.AsyncExitStack() as stack:
-        await stack.enter_async_context(self.send_semaphore)
-
-        try:
-            forum = await self.bot.fetch_channel(TRANSPARENCY_FORUM_ID)
-            post = await forum.fetch_post(LOG_POST_ID)
-
-            if post.archived:
-                await post.edit(archived=False)
-
-            MAX_RETRIES = 3
-            BACKOFF_TIME = 1.0
-
-            for attempt in range(MAX_RETRIES):
+            async with self.send_semaphore:
                 try:
-                    paginator = await Paginator.create_from_embeds(
-                        self.bot,
-                        embed,
-                        timeout=120,
-                    )
-                    await paginator.send(post)
-                    break
-                except Exception as e:
-                    if attempt == MAX_RETRIES - 1:
-                        logger.error(
-                            "Failed to send embed after %d attempts: %s",
-                            MAX_RETRIES,
-                            str(e),
-                        )
+                    forum = await self.bot.fetch_channel(TRANSPARENCY_FORUM_ID)
+                    if not forum:
+                        logger.error("Could not fetch transparency forum channel")
                         return
-                    await asyncio.sleep(BACKOFF_TIME * (2**attempt))
+
+                    post = await forum.fetch_post(LOG_POST_ID)
+                    if not post:
+                        logger.error("Could not fetch log post")
+                        return
+
+                    if post.archived:
+                        try:
+                            await post.edit(archived=False)
+                        except Exception as e:
+                            logger.error(f"Failed to unarchive post: {e}")
+                            return
+
+                    try:
+                        await post.send(embeds=embed)
+                        logger.info("Successfully sent embed")
+                    except Exception as e:
+                        logger.error(f"Failed to send embed: {e}")
+                        return
+
+                except HTTPException as e:
+                    logger.error(f"HTTP error while sending event log: {e}")
+                except Forbidden as e:
+                    logger.error(f"Permission error while sending event log: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error while sending event log: {e}")
 
         except Exception as e:
-            logger.error("Failed to send event log: %s", str(e))
+            logger.exception(f"Critical error in log_event: {e}")
+            raise
 
 
 @contextlib.asynccontextmanager
@@ -476,6 +481,7 @@ class Statistics(interactions.Extension):
             role_id: 0 for role_id in MONITORED_ROLE_IDS
         }
 
+        self._cleanup_tasks: List[asyncio.Task] = []
         self.update_lock: asyncio.Lock = asyncio.Lock()
         self.stats_message: Optional[interactions.Message] = None
         self.send_semaphore: asyncio.Semaphore = asyncio.Semaphore(5)
@@ -648,10 +654,32 @@ class Statistics(interactions.Extension):
         )
 
         try:
+            if not os.path.exists(STATS_FILE_PATH):
+                default_stats = {
+                    "interaction_count_history": list(self.interaction_count_history),
+                    "timestamp_history": list(self.timestamp_history),
+                    "role_counts": {
+                        str(role_id): count
+                        for role_id, count in self.role_counts.items()
+                    },
+                }
+                async with aiofiles.open(STATS_FILE_PATH, mode="w") as f:
+                    await f.write(orjson.dumps(default_stats).decode("utf-8"))
+
             async with aiofiles.open(STATS_FILE_PATH, mode="rb") as f:
                 content = await f.read()
 
-            orjson.loads(content)
+            try:
+                orjson.loads(content)
+            except orjson.JSONDecodeError:
+                await ctx.send(
+                    embeds=interactions.Embed(
+                        title="Error",
+                        description="The stats file is corrupted. Creating a new one.",
+                        color=EmbedColor.ERROR,
+                    )
+                )
+                return
 
             async with aiofiles.open(temp_file_path, mode="wb") as temp_file:
                 await temp_file.write(content)
@@ -659,6 +687,16 @@ class Statistics(interactions.Extension):
                 os.fsync(temp_file.fileno())
 
             await ctx.send(file=interactions.File(temp_file_path))
+
+        except Exception as e:
+            await ctx.send(
+                embeds=interactions.Embed(
+                    title="Error",
+                    description=f"Failed to export stats: {str(e)}",
+                    color=EmbedColor.ERROR,
+                )
+            )
+            logger.error(f"Failed to export stats: {e}")
 
         finally:
             if os.path.exists(temp_file_path):
@@ -681,30 +719,39 @@ class Statistics(interactions.Extension):
     ) -> List[InteractionRecord]:
         interactions_set: set[InteractionRecord] = set()
 
-        if not (threads := await target_forum.fetch_posts()):
-            logger.error("Failed to fetch posts: No threads returned")
-            return []
+        try:
+            if not (threads := await target_forum.fetch_posts()):
+                logger.error("Failed to fetch posts: No threads returned")
+                return []
 
-        for thread in threads:
-            if not (thread_members := await thread.fetch_members()):
-                logger.error(f"Failed to fetch members for thread {thread.id}")
-                continue
+            for thread in threads:
+                try:
+                    if not (thread_members := await thread.fetch_members()):
+                        logger.warning(f"No members found for thread {thread.id}")
+                        continue
 
-            interactions_set.update(
-                InteractionRecord(thread.id, member.id) for member in thread_members
-            )
+                    interactions_set.update(
+                        InteractionRecord(thread.id, member.id)
+                        for member in thread_members
+                    )
 
-            async for message in thread.history():
-                if not message.reactions:
+                    async for message in thread.history(limit=100):
+                        if not message.reactions:
+                            continue
+
+                        for reaction in message.reactions:
+                            async for user in reaction.users():
+                                interactions_set.add(
+                                    InteractionRecord(thread.id, user.id)
+                                )
+
+                except Exception as e:
+                    logger.error(f"Error processing thread {thread.id}: {e}")
                     continue
 
-                interactions_set.update(
-                    [
-                        InteractionRecord(thread.id, user.id)
-                        async for reaction in message.reactions
-                        async for user in reaction.users()
-                    ]
-                )
+        except Exception as e:
+            logger.error(f"Failed to fetch interactions: {e}")
+            return []
 
         return list(interactions_set)
 
@@ -844,23 +891,30 @@ class Statistics(interactions.Extension):
     # Event
 
     @event_handler(EventType.CHANNEL, "Create")
-    def on_channel_create(self, event: ChannelCreate) -> EventLog:
+    async def on_channel_create(self, event: ChannelCreate) -> EventLog:
         channel = event.channel
         channel_type = str(channel.type).replace("_", " ").title()
         created_timestamp = channel.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        category_name = channel.parent.name if channel.parent else "None"
-        category_id = str(channel.parent.id) if channel.parent else "N/A"
+        parent_channel = None
+        if hasattr(channel, "parent_id") and channel.parent_id:
+            try:
+                parent_channel = await self.bot.fetch_channel(channel.parent_id)
+            except:
+                pass
+
+        category_name = parent_channel.name if parent_channel else "None"
+        category_id = str(parent_channel.id) if parent_channel else "N/A"
 
         permission_details = []
-        for target_id, overwrite in channel.permission_overwrites.items():
-            target_type = "Role" if isinstance(target_id, int) else "Member"
+        for overwrite in channel.permission_overwrites:
+            target_type = "Role" if overwrite.type == 0 else "Member"
             allow_perms = [p for p in overwrite.allow] if overwrite.allow else []
             deny_perms = [p for p in overwrite.deny] if overwrite.deny else []
 
             if allow_perms or deny_perms:
                 permission_details.append(
-                    f"{target_type} {target_id}:\n"
+                    f"{target_type} {overwrite.id}:\n"
                     + (
                         f"  Allow: {', '.join(str(p) for p in allow_perms)}\n"
                         if allow_perms
@@ -920,14 +974,18 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.CHANNEL, "Delete")
-    def on_channel_delete(self, event: ChannelDelete) -> EventLog:
+    async def on_channel_delete(self, event: ChannelDelete) -> EventLog:
         channel = event.channel
         channel_type = str(channel.type).replace("_", " ").title()
         deleted_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         lifetime = datetime.now(timezone.utc) - channel.created_at
 
-        category_name = channel.parent.name if channel.parent else "None"
-        category_id = str(channel.parent.id) if channel.parent else "N/A"
+        category_name = (
+            channel.guild.get_channel(channel.parent_id).name
+            if channel.parent_id
+            else "None"
+        )
+        category_id = str(channel.parent_id) if channel.parent_id else "N/A"
 
         fields = [
             ("Channel Name", channel.name, True),
@@ -966,6 +1024,13 @@ class Statistics(interactions.Extension):
         if hasattr(channel, "members"):
             fields.append(("Member Count", str(len(channel.members)), True))
 
+        if hasattr(channel, "rtc_region") and channel.rtc_region:
+            fields.append(("Voice Region", channel.rtc_region, True))
+
+        if hasattr(channel, "video_quality_mode"):
+            quality_mode = "Auto" if channel.video_quality_mode == 1 else "720p"
+            fields.append(("Video Quality", quality_mode, True))
+
         return EventLog(
             title="Channel Deleted",
             description=f"The {channel_type.lower()} channel `{channel.name}` has been permanently deleted.",
@@ -974,14 +1039,14 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.CHANNEL, "Update")
-    def on_channel_update(self, event: ChannelUpdate) -> EventLog:
-        if event.before.parent_id == EXCLUDED_CATEGORY_ID:
-            return EventLog(
-                title="Channel Updated (Excluded)",
-                description="A channel in an excluded category was updated. Details hidden for privacy.",
-                color=EmbedColor.INFO,
-                fields=(),
-            )
+    async def on_channel_update(self, event: ChannelUpdate) -> EventLog:
+        # if event.before.parent_id == EXCLUDED_CATEGORY_ID:
+        #    return EventLog(
+        #        title="Channel Updated (Excluded)",
+        #        description="A channel in an excluded category was updated. Details hidden for privacy.",
+        #        color=EmbedColor.INFO,
+        #        fields=(),
+        #    )
 
         fields = []
         before = event.before
@@ -1007,7 +1072,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Category Change",
-                    f"From: `{before_category}` (ID: {before.parent_id})\nTo: `{after_category}` (ID: {after.parent_id})",
+                    f"From: `{before_category}` (ID: {before.parent_id or 'None'})\nTo: `{after_category}` (ID: {after.parent_id or 'None'}`)",
                     True,
                 )
             )
@@ -1076,14 +1141,17 @@ class Statistics(interactions.Extension):
                 )
 
         if before.permission_overwrites != after.permission_overwrites:
-            added_overwrites = set(after.permission_overwrites.keys()) - set(
-                before.permission_overwrites.keys()
+            before_overwrites = {po.id: po for po in before.permission_overwrites}
+            after_overwrites = {po.id: po for po in after.permission_overwrites}
+
+            added_overwrites = set(after_overwrites.keys()) - set(
+                before_overwrites.keys()
             )
-            removed_overwrites = set(before.permission_overwrites.keys()) - set(
-                after.permission_overwrites.keys()
+            removed_overwrites = set(before_overwrites.keys()) - set(
+                after_overwrites.keys()
             )
-            modified_overwrites = set(before.permission_overwrites.keys()) & set(
-                after.permission_overwrites.keys()
+            modified_overwrites = set(before_overwrites.keys()) & set(
+                after_overwrites.keys()
             )
 
             permission_changes = []
@@ -1101,13 +1169,10 @@ class Statistics(interactions.Extension):
                 )
 
             for target_id in modified_overwrites:
-                if (
-                    before.permission_overwrites[target_id]
-                    != after.permission_overwrites[target_id]
-                ):
-                    before_perms = before.permission_overwrites[target_id]
-                    after_perms = after.permission_overwrites[target_id]
+                before_perms = before_overwrites[target_id]
+                after_perms = after_overwrites[target_id]
 
+                if before_perms != after_perms:
                     added_allows = set(after_perms.allow or []) - set(
                         before_perms.allow or []
                     )
@@ -1173,14 +1238,16 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.ROLE, "Create")
-    def on_role_create(self, event: RoleCreate) -> EventLog:
+    async def on_role_create(self, event: RoleCreate) -> EventLog:
         role = event.role
         created_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        color_hex = f"#{role.color:06x}" if role.color else "Default"
+        color_hex = f"#{role.color.value:06x}" if role.color else "Default"
 
         permissions = [str(p) for p in role.permissions] if role.permissions else []
-        permission_text = ", ".join(permissions) if permissions else "No permissions"
+        permission_text = (
+            ", ".join(str(p) for p in permissions) if permissions else "No permissions"
+        )
 
         fields = [
             ("Role Name", role.name, True),
@@ -1203,7 +1270,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.ROLE, "Delete")
-    def on_role_delete(self, event: RoleDelete) -> EventLog:
+    async def on_role_delete(self, event: RoleDelete) -> EventLog:
         role = event.role
         deleted_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -1218,10 +1285,12 @@ class Statistics(interactions.Extension):
                 ),
             )
 
-        color_hex = f"#{role.color:06x}" if role.color else "Default"
+        color_hex = f"#{role.color.value:06x}" if role.color else "Default"
 
         permissions = [str(p) for p in role.permissions] if role.permissions else []
-        permission_text = ", ".join(permissions) if permissions else "No permissions"
+        permission_text = (
+            ", ".join(str(p) for p in permissions) if permissions else "No permissions"
+        )
 
         role_age = datetime.now(timezone.utc) - role.created_at
         age_text = f"{role_age.days} days, {role_age.seconds//3600} hours"
@@ -1254,14 +1323,14 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.ROLE, "Update")
-    def on_role_update(self, event: RoleUpdate) -> EventLog:
+    async def on_role_update(self, event: RoleUpdate) -> EventLog:
         fields = []
         before = event.before
         after = event.after
 
         if before.color != after.color:
-            before_color = f"#{before.color:06x}" if before.color else "Default"
-            after_color = f"#{after.color:06x}" if after.color else "Default"
+            before_color = f"#{before.color.value:06x}" if before.color else "Default"
+            after_color = f"#{after.color.value:06x}" if after.color else "Default"
             fields.append(
                 ("Color Change", f"From: {before_color}\nTo: {after_color}", True)
             )
@@ -1361,20 +1430,19 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.VOICE, "StateUpdate")
-    def on_voice_state_update(self, event: VoiceStateUpdate) -> EventLog:
+    async def on_voice_state_update(self, event: VoiceStateUpdate) -> EventLog:
         fields = []
         before = event.before
-        state = event.state
-        member = state.member
+        after = event.after
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        if before and before.channel != state.channel:
+        if before and after and before.channel != after.channel:
             before_channel = before.channel.name if before.channel else "None"
-            after_channel = state.channel.name if state.channel else "None"
+            after_channel = after.channel.name if after.channel else "None"
 
-            if not before.channel and state.channel:
+            if not before.channel and after.channel:
                 action = "joined"
-            elif before.channel and not state.channel:
+            elif before.channel and not after.channel:
                 action = "left"
             else:
                 action = "moved between"
@@ -1389,78 +1457,79 @@ class Statistics(interactions.Extension):
                 )
             )
 
-        if before and before.mute != state.mute:
+        if before and after and before.mute != after.mute:
             fields.append(
                 (
                     "Server Mute",
-                    f"{'Muted by server' if state.mute else 'Unmuted by server'}",
+                    f"{'Muted by server' if after.mute else 'Unmuted by server'}",
                     True,
                 )
             )
 
-        if before and before.deaf != state.deaf:
+        if before and after and before.deaf != after.deaf:
             fields.append(
                 (
                     "Server Deafen",
-                    f"{'Deafened by server' if state.deaf else 'Undeafened by server'}",
+                    f"{'Deafened by server' if after.deaf else 'Undeafened by server'}",
                     True,
                 )
             )
 
-        if before and before.self_mute != state.self_mute:
+        if before and after and before.self_mute != after.self_mute:
             fields.append(
                 (
                     "Self Mute",
-                    f"User {'muted themselves' if state.self_mute else 'unmuted themselves'}",
+                    f"User {'muted themselves' if after.self_mute else 'unmuted themselves'}",
                     True,
                 )
             )
 
-        if before and before.self_deaf != state.self_deaf:
+        if before and after and before.self_deaf != after.self_deaf:
             fields.append(
                 (
                     "Self Deafen",
-                    f"User {'deafened themselves' if state.self_deaf else 'undeafened themselves'}",
+                    f"User {'deafened themselves' if after.self_deaf else 'undeafened themselves'}",
                     True,
                 )
             )
 
-        if before and before.self_stream != state.self_stream:
+        if before and after and before.self_stream != after.self_stream:
             fields.append(
                 (
                     "Streaming Status",
-                    f"User {'started' if state.self_stream else 'stopped'} streaming",
+                    f"User {'started' if after.self_stream else 'stopped'} streaming",
                     True,
                 )
             )
 
-        if before and before.self_video != state.self_video:
+        if before and after and before.self_video != after.self_video:
             fields.append(
                 (
                     "Video Status",
-                    f"User {'enabled' if state.self_video else 'disabled'} their camera",
+                    f"User {'enabled' if after.self_video else 'disabled'} their camera",
                     True,
                 )
             )
 
-        if before and before.suppress != state.suppress:
+        if before and after and before.suppress != after.suppress:
             fields.append(
                 (
                     "Suppress Status",
-                    f"User {'is now suppressed' if state.suppress else 'is no longer suppressed'}",
+                    f"User {'is now suppressed' if after.suppress else 'is no longer suppressed'}",
                     True,
                 )
             )
 
         if (
             before
-            and before.request_to_speak_timestamp != state.request_to_speak_timestamp
+            and after
+            and before.request_to_speak_timestamp != after.request_to_speak_timestamp
         ):
-            if state.request_to_speak_timestamp:
+            if after.request_to_speak_timestamp:
                 fields.append(
                     (
                         "Speaking Request",
-                        f"User requested to speak at {state.request_to_speak_timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                        f"User requested to speak at {after.request_to_speak_timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
                         True,
                     )
                 )
@@ -1469,46 +1538,58 @@ class Statistics(interactions.Extension):
                     ("Speaking Request", "User's request to speak was removed", True)
                 )
 
-        fields.extend(
-            [
-                ("User", member.display_name, True),
-                ("User ID", str(member.id), True),
-                ("Nickname", member.nick if member.nick else "None", True),
-                (
-                    "Roles",
+        if after and after.member:
+            fields.extend(
+                [
+                    ("User", after.member.display_name, True),
+                    ("User ID", str(after.member.id), True),
                     (
-                        ", ".join(role.name for role in member.roles)
-                        if member.roles
-                        else "None"
+                        "Nickname",
+                        after.member.nick if after.member.nick else "None",
+                        True,
                     ),
-                    False,
-                ),
-                ("Session ID", state.session_id, True),
-                ("Updated At", timestamp, True),
-            ]
-        )
+                    (
+                        "Roles",
+                        (
+                            ", ".join(role.name for role in after.member.roles)
+                            if after.member.roles
+                            else "None"
+                        ),
+                        False,
+                    ),
+                    ("Session ID", after.session_id, True),
+                    ("Updated At", timestamp, True),
+                ]
+            )
 
-        current_state = [
-            f"Channel: {state.channel.name if state.channel else 'None'}",
-            f"Server Muted: {'Yes' if state.mute else 'No'}",
-            f"Server Deafened: {'Yes' if state.deaf else 'No'}",
-            f"Self Muted: {'Yes' if state.self_mute else 'No'}",
-            f"Self Deafened: {'Yes' if state.self_deaf else 'No'}",
-            f"Streaming: {'Yes' if state.self_stream else 'No'}",
-            f"Camera On: {'Yes' if state.self_video else 'No'}",
-            f"Suppressed: {'Yes' if state.suppress else 'No'}",
-        ]
-        fields.append(("Current Voice State", "\n".join(current_state), False))
+            current_state = [
+                f"Channel: {after.channel.name if after.channel else 'None'}",
+                f"Server Muted: {'Yes' if after.mute else 'No'}",
+                f"Server Deafened: {'Yes' if after.deaf else 'No'}",
+                f"Self Muted: {'Yes' if after.self_mute else 'No'}",
+                f"Self Deafened: {'Yes' if after.self_deaf else 'No'}",
+                f"Streaming: {'Yes' if after.self_stream else 'No'}",
+                f"Camera On: {'Yes' if after.self_video else 'No'}",
+                f"Suppressed: {'Yes' if after.suppress else 'No'}",
+            ]
+            fields.append(("Current Voice State", "\n".join(current_state), False))
+
+            return EventLog(
+                title="Voice State Updated",
+                description=f"Voice state changes detected for {after.member.display_name}",
+                color=EmbedColor.UPDATE,
+                fields=tuple(fields),
+            )
 
         return EventLog(
             title="Voice State Updated",
-            description=f"Voice state changes detected for {member.display_name}",
+            description="Voice state changes detected but member information unavailable",
             color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
 
     @event_handler(EventType.GUILD, "Update")
-    def on_guild_update(self, event: GuildUpdate) -> EventLog:
+    async def on_guild_update(self, event: GuildUpdate) -> EventLog:
         fields = []
         before = event.before
         after = event.after
@@ -1699,7 +1780,7 @@ class Statistics(interactions.Extension):
                 fields.append(
                     (
                         "Added Features",
-                        "\n".join(f"• {feature}" for feature in added_features),
+                        "\n".join(f"- {feature}" for feature in added_features),
                         True,
                     )
                 )
@@ -1708,7 +1789,7 @@ class Statistics(interactions.Extension):
                 fields.append(
                     (
                         "Removed Features",
-                        "\n".join(f"• {feature}" for feature in removed_features),
+                        "\n".join(f"- {feature}" for feature in removed_features),
                         True,
                     )
                 )
@@ -1747,7 +1828,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.GUILD, "EmojisUpdate")
-    def on_guild_emojis_update(self, event: GuildEmojisUpdate) -> EventLog:
+    async def on_guild_emojis_update(self, event: GuildEmojisUpdate) -> EventLog:
         added_emojis = set(event.after) - set(event.before)
         removed_emojis = set(event.before) - set(event.after)
         modified_emojis = {
@@ -1842,7 +1923,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.INVITE, "Create")
-    def on_invite_create(self, event: InviteCreate) -> EventLog:
+    async def on_invite_create(self, event: InviteCreate) -> EventLog:
         fields = [
             ("Created By", event.inviter.display_name, True),
             ("Creator ID", str(event.inviter.id), True),
@@ -1885,7 +1966,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.INVITE, "Delete")
-    def on_invite_delete(self, event: InviteDelete) -> EventLog:
+    async def on_invite_delete(self, event: InviteDelete) -> EventLog:
         fields = [
             ("Channel", event.channel.name, True),
             ("Channel ID", str(event.channel.id), True),
@@ -1909,7 +1990,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.BAN, "Create")
-    def on_ban_create(self, event: BanCreate) -> EventLog:
+    async def on_ban_create(self, event: BanCreate) -> EventLog:
         fields = [
             ("User", event.user.display_name, True),
             ("User ID", str(event.user.id), True),
@@ -1940,7 +2021,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.BAN, "Remove")
-    def on_ban_remove(self, event: BanRemove) -> EventLog:
+    async def on_ban_remove(self, event: BanRemove) -> EventLog:
         fields = [
             ("User", event.user.display_name, True),
             ("User ID", str(event.user.id), True),
@@ -1970,7 +2051,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.SCHEDULED_EVENT, "Create")
-    def on_guild_scheduled_event_create(
+    async def on_guild_scheduled_event_create(
         self, event: GuildScheduledEventCreate
     ) -> EventLog:
         description = event.scheduled_event.description
@@ -2044,7 +2125,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.SCHEDULED_EVENT, "Update")
-    def on_guild_scheduled_event_update(
+    async def on_guild_scheduled_event_update(
         self, event: GuildScheduledEventUpdate
     ) -> EventLog:
         fields = []
@@ -2159,7 +2240,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.SCHEDULED_EVENT, "Delete")
-    def on_guild_scheduled_event_delete(
+    async def on_guild_scheduled_event_delete(
         self, event: GuildScheduledEventDelete
     ) -> EventLog:
         fields = [
@@ -2241,7 +2322,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.STAGE_INSTANCE, "Create")
-    def on_stage_instance_create(self, event: StageInstanceCreate) -> EventLog:
+    async def on_stage_instance_create(self, event: StageInstanceCreate) -> EventLog:
         fields = [
             ("Topic", event.stage_instance.topic, True),
             ("Channel", event.stage_instance.channel.name, True),
@@ -2280,7 +2361,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.STAGE_INSTANCE, "Update")
-    def on_stage_instance_update(self, event: StageInstanceUpdate) -> EventLog:
+    async def on_stage_instance_update(self, event: StageInstanceUpdate) -> EventLog:
         fields = [
             ("Topic", event.stage_instance.topic, True),
             ("Channel", event.stage_instance.channel.name, True),
@@ -2319,7 +2400,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.STAGE_INSTANCE, "Delete")
-    def on_stage_instance_delete(self, event: StageInstanceDelete) -> EventLog:
+    async def on_stage_instance_delete(self, event: StageInstanceDelete) -> EventLog:
         fields = [
             ("Topic", event.stage_instance.topic, True),
             ("Channel", event.stage_instance.channel.name, True),
@@ -2356,7 +2437,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.WEBHOOK, "Update")
-    def on_webhooks_update(self, event: WebhooksUpdate) -> EventLog:
+    async def on_webhooks_update(self, event: WebhooksUpdate) -> EventLog:
         fields = [
             ("Channel ID", str(event.channel_id), True),
             ("Guild ID", str(event.guild_id), True),
@@ -2375,7 +2456,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.VOICE, "UserMute")
-    def on_voice_user_mute(self, event: VoiceUserMute) -> EventLog:
+    async def on_voice_user_mute(self, event: VoiceUserMute) -> EventLog:
         action = "muted" if event.mute else "unmuted"
         fields = [
             ("User", event.author.display_name, True),
@@ -2400,7 +2481,9 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.VOICE, "UserMove")
-    def on_voice_user_move(self, event: VoiceUserMove) -> EventLog:
+    async def on_voice_user_move(self, event: VoiceUserMove) -> EventLog:
+        guild = event.new_channel.guild if event.new_channel else None
+
         fields = [
             ("User", event.state.member.display_name, True),
             ("User ID", str(event.state.member.id), True),
@@ -2408,8 +2491,8 @@ class Statistics(interactions.Extension):
             ("From Channel ID", str(event.previous_channel.id), True),
             ("To Channel", event.new_channel.name, True),
             ("To Channel ID", str(event.new_channel.id), True),
-            ("Guild", event.guild.name if event.guild else "Unknown", True),
-            ("Guild ID", str(event.guild.id) if event.guild else "Unknown", True),
+            ("Guild", guild.name if guild else "Unknown", True),
+            ("Guild ID", str(guild.id) if guild else "Unknown", True),
             (
                 "Moved At",
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -2425,7 +2508,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.VOICE, "UserDeafen")
-    def on_voice_user_deafen(self, event: VoiceUserDeafen) -> EventLog:
+    async def on_voice_user_deafen(self, event: VoiceUserDeafen) -> EventLog:
         action = "deafened" if event.deaf else "undeafened"
         fields = [
             ("User", event.author.display_name, True),
@@ -2450,7 +2533,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.THREAD, "ListSync")
-    def on_thread_list_sync(self, event: ThreadListSync) -> EventLog:
+    async def on_thread_list_sync(self, event: ThreadListSync) -> EventLog:
         active_threads = [thread for thread in event.threads if not thread.archived]
         archived_threads = [thread for thread in event.threads if thread.archived]
 
@@ -2485,7 +2568,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.MESSAGE, "DeleteBulk")
-    def on_message_delete_bulk(self, event: MessageDeleteBulk) -> EventLog:
+    async def on_message_delete_bulk(self, event: MessageDeleteBulk) -> EventLog:
         fields = [
             ("Channel ID", str(event.channel_id), True),
             ("Messages Deleted", str(len(event.ids)), True),
@@ -2511,7 +2594,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.GUILD, "Unavailable")
-    def on_guild_unavailable(self, event: GuildUnavailable) -> EventLog:
+    async def on_guild_unavailable(self, event: GuildUnavailable) -> EventLog:
         fields = [
             ("Guild ID", str(event.guild_id), True),
             (
@@ -2529,7 +2612,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.GUILD, "StickersUpdate")
-    def on_guild_stickers_update(self, event: GuildStickersUpdate) -> EventLog:
+    async def on_guild_stickers_update(self, event: GuildStickersUpdate) -> EventLog:
         fields = [
             ("Guild", event.guild.name, True),
             ("Total Stickers", str(len(event.stickers)), True),
@@ -2557,7 +2640,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.SCHEDULED_EVENT, "UserRemove")
-    def on_guild_scheduled_event_user_remove(
+    async def on_guild_scheduled_event_user_remove(
         self, event: GuildScheduledEventUserRemove
     ) -> EventLog:
         fields = [
@@ -2586,7 +2669,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.SCHEDULED_EVENT, "UserAdd")
-    def on_guild_scheduled_event_user_add(
+    async def on_guild_scheduled_event_user_add(
         self, event: GuildScheduledEventUserAdd
     ) -> EventLog:
         fields = [
@@ -2615,7 +2698,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.GUILD, "MembersChunk")
-    def on_guild_members_chunk(self, event: GuildMembersChunk) -> EventLog:
+    async def on_guild_members_chunk(self, event: GuildMembersChunk) -> EventLog:
         fields = [
             ("Guild", event.guild.name, True),
             ("Member Count", str(len(event.members)), True),
@@ -2647,7 +2730,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.GUILD, "Available")
-    def on_guild_available(self, event: GuildAvailable) -> EventLog:
+    async def on_guild_available(self, event: GuildAvailable) -> EventLog:
         fields = [
             ("Guild", event.guild.name, True),
             ("Guild ID", str(event.guild.id), True),
@@ -2675,7 +2758,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.ENTITLEMENT, "Update")
-    def on_entitlement_update(self, event: EntitlementUpdate) -> EventLog:
+    async def on_entitlement_update(self, event: EntitlementUpdate) -> EventLog:
         fields = [
             ("Entitlement ID", str(event.entitlement.id), True),
             ("User ID", str(event.entitlement.user_id), True),
@@ -2721,7 +2804,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.ENTITLEMENT, "Delete")
-    def on_entitlement_delete(self, event: EntitlementDelete) -> EventLog:
+    async def on_entitlement_delete(self, event: EntitlementDelete) -> EventLog:
         fields = [
             ("Entitlement ID", str(event.entitlement.id), True),
             ("User ID", str(event.entitlement.user_id), True),
@@ -2767,7 +2850,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.ENTITLEMENT, "Create")
-    def on_entitlement_create(self, event: EntitlementCreate) -> EventLog:
+    async def on_entitlement_create(self, event: EntitlementCreate) -> EventLog:
         fields = [
             ("Entitlement ID", str(event.entitlement.id), True),
             ("User ID", str(event.entitlement.user_id), True),
@@ -2813,7 +2896,7 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.AUTOMOD, "Exec")
-    def on_auto_mod_exec(self, event: AutoModExec) -> EventLog:
+    async def on_auto_mod_exec(self, event: AutoModExec) -> EventLog:
         fields = [
             ("Guild ID", str(event.guild_id), True),
             ("Action", str(event.action), True),
