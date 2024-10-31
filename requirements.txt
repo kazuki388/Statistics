@@ -1,0 +1,4 @@
+aiofiles
+discord-py-interactions
+orjson
+loguru
