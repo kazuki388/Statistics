@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import functools
 import inspect
+import logging
 import os
 import time
 import uuid
@@ -9,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum, auto
+from logging.handlers import RotatingFileHandler
 from typing import (
     Any,
     AsyncGenerator,
@@ -67,40 +69,21 @@ from interactions.api.events import (
     WebhooksUpdate,
 )
 from interactions.client.errors import Forbidden, HTTPException
-from loguru import logger
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE: str = os.path.join(BASE_DIR, "stats.log")
 
-logger.remove()
-logger.add(
-    sink=LOG_FILE,
-    level="DEBUG",
-    format=(
-        "{time:YYYY-MM-DD HH:mm:ss.SSS ZZ} | "
-        "{process}:{thread} | "
-        "{level: <8} | "
-        "{name}:{function}:{line} - "
-        "{message}"
-    ),
-    filter=lambda record: (
-        record["name"].startswith(
-            "extensions.github_d_com__kazuki388_s_Statistics.main"
-        )
-    ),
-    colorize=None,
-    serialize=False,
-    backtrace=True,
-    diagnose=True,
-    context=None,
-    enqueue=False,
-    catch=True,
-    rotation="1 MB",
-    retention=1,
-    compression="gz",
-    encoding="utf-8",
-    mode="a",
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+formatter = logging.Formatter(
+    "%(asctime)s | %(process)d:%(thread)d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s",
+    "%Y-%m-%d %H:%M:%S.%f %z",
 )
+file_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
+)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 # Model
 
