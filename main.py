@@ -68,10 +68,11 @@ from interactions.api.events import (
     VoiceUserMute,
     WebhooksUpdate,
 )
-from interactions.client.errors import Forbidden, HTTPException
+from interactions.client.errors import Forbidden
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE: str = os.path.join(BASE_DIR, "stats.log")
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -85,7 +86,9 @@ file_handler = RotatingFileHandler(
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
+
 # Model
+
 
 GUILD_ID: int = 1150630510696075404
 MONITORED_FORUM_ID: int = 1155914521907568740
@@ -256,6 +259,7 @@ event_class_mapping: dict[str, Type[BaseEvent]] = {
     )
 }
 
+
 # Decorator
 
 
@@ -289,7 +293,10 @@ def event_handler(
                     if inspect.iscoroutinefunction(func)
                     else func(self, event)
                 )
-                await log_event(self, f"{_event_type_name}{_event_action}", event_log)
+                if event_log is not None:
+                    await log_event(
+                        self, f"{_event_type_name}{_event_action}", event_log
+                    )
             except Exception as e:
                 logger.exception(
                     "Critical error in event handler %s: %s", func.__qualname__, str(e)
@@ -342,14 +349,14 @@ def create_embed(event_log: EventLog) -> interactions.Embed:
         description=event_log.description,
         color=event_log.color.value,
         timestamp=datetime.now(timezone.utc).astimezone(),
-        fields=tuple(
+        fields=[
             interactions.EmbedField(
                 name=str(name),
                 value=str(value) if value else "N/A",
                 inline=bool(inline),
             )
             for name, value, inline in event_log.fields
-        ),
+        ],
     )
 
 
@@ -390,8 +397,6 @@ async def log_event(self, event_name: str, event_log: EventLog) -> None:
                         logger.error(f"Failed to send embed: {e}")
                         return
 
-                except HTTPException as e:
-                    logger.error(f"HTTP error while sending event log: {e}")
                 except Forbidden as e:
                     logger.error(f"Permission error while sending event log: {e}")
                 except Exception as e:
@@ -588,14 +593,14 @@ class Statistics(interactions.Extension):
         embed = interactions.Embed(
             title="Guild Statistics",
             color=EmbedColor.SUCCESS.value,
-            fields=(
+            fields=[
                 interactions.EmbedField(
                     name=f"{name.replace('_', ' ').title()}",
                     value=str(value),
                     inline=True,
                 )
                 for name, value in stats.items()
-            ),
+            ],
             footer=interactions.EmbedFooter(
                 text=f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
             ),
@@ -612,14 +617,14 @@ class Statistics(interactions.Extension):
         embed = interactions.Embed(
             title="Role Statistics",
             color=EmbedColor.SUCCESS.value,
-            fields=(
+            fields=[
                 interactions.EmbedField(
                     name=f"Role {role.display_name}",
                     value=f"Count: {role.count}",
                     inline=False,
                 )
                 for role in role_data
-            ),
+            ],
             footer=interactions.EmbedFooter(
                 text=f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
             ),
@@ -647,7 +652,7 @@ class Statistics(interactions.Extension):
                     },
                 }
                 async with aiofiles.open(STATS_FILE_PATH, mode="w") as f:
-                    await f.write(orjson.dumps(default_stats).decode("utf-8"))
+                    await f.write(orjson.dumps(default_stats).decode())
 
             async with aiofiles.open(STATS_FILE_PATH, mode="rb") as f:
                 content = await f.read()
@@ -718,7 +723,7 @@ class Statistics(interactions.Extension):
                         for member in thread_members
                     )
 
-                    async for message in thread.history(limit=100):
+                    async for message in thread.history():
                         if not message.reactions:
                             continue
 
@@ -738,10 +743,11 @@ class Statistics(interactions.Extension):
 
         return list(interactions_set)
 
+    @staticmethod
     async def _get_monitored_forum_stats(
-        self, channel: interactions.GuildForum
+        channel: interactions.GuildForum,
     ) -> interactions.Embed:
-        async with aiofiles.open(STATS_FILE_PATH, "r") as f:
+        async with aiofiles.open(STATS_FILE_PATH) as f:
             interaction_data: dict = orjson.loads(await f.read())
 
         recent_data = tuple(
@@ -754,10 +760,12 @@ class Statistics(interactions.Extension):
         return interactions.Embed(
             title=f"Forum Activities for {channel.name} (Last 10 Entries)",
             color=EmbedColor.SUCCESS,
-            fields=(
-                {"name": dt, "value": f"Activities: {count}", "inline": True}
+            fields=[
+                interactions.EmbedField(
+                    name=dt, value=f"Activities: {count}", inline=True
+                )
                 for dt, count in recent_data
-            ),
+            ],
         )
 
     async def _get_realtime_forum_stats(
@@ -769,24 +777,24 @@ class Statistics(interactions.Extension):
         return interactions.Embed(
             title=f"Real-time Forum Activities for {channel.name}",
             color=0x00FF00,
-            fields=(
-                {
-                    "name": "Timestamp",
-                    "value": current_time,
-                    "inline": True,
-                },
-                {
-                    "name": "Interaction Count",
-                    "value": str(
+            fields=[
+                interactions.EmbedField(
+                    name="Timestamp",
+                    value=current_time,
+                    inline=True,
+                ),
+                interactions.EmbedField(
+                    name="Interaction Count",
+                    value=str(
                         len(
                             await current_valid_interactions
                             if current_valid_interactions
                             else []
                         )
                     ),
-                    "inline": True,
-                },
-            ),
+                    inline=True,
+                ),
+            ],
         )
 
     async def fetch_role_counts(self, guild_id: int) -> List[RoleRecord]:
@@ -994,7 +1002,7 @@ class Statistics(interactions.Extension):
             fields.append(("Last Topic", channel.topic, False))
 
         if hasattr(channel, "message_count"):
-            fields.append(("Total Messages", str(channel.message_count), True))
+            fields = [*fields, ("Total Messages", str(channel.message_count), True)]
 
         if hasattr(channel, "bitrate"):
             fields.append(("Last Bitrate", f"{channel.bitrate//1000}kbps", True))
@@ -1025,14 +1033,10 @@ class Statistics(interactions.Extension):
         )
 
     @event_handler(EventType.CHANNEL, "Update")
-    async def on_channel_update(self, event: ChannelUpdate) -> EventLog:
-        # if event.before.parent_id == EXCLUDED_CATEGORY_ID:
-        #    return EventLog(
-        #        title="Channel Updated (Excluded)",
-        #        description="A channel in an excluded category was updated. Details hidden for privacy.",
-        #        color=EmbedColor.INFO,
-        #        fields=(),
-        #    )
+    async def on_channel_update(self, event: ChannelUpdate) -> Optional[EventLog]:
+
+        if event.before.parent_id == EXCLUDED_CATEGORY_ID:
+            return None
 
         fields = []
         before = event.before
@@ -1053,8 +1057,8 @@ class Statistics(interactions.Extension):
             )
 
         if before.parent_id != after.parent_id:
-            before_category = before.parent.name if before.parent else "None"
-            after_category = after.parent.name if after.parent else "None"
+            before_category = before.category.name if before.category else "None"
+            after_category = after.category.name if after.category else "None"
             fields.append(
                 (
                     "Category Change",
@@ -1591,8 +1595,8 @@ class Statistics(interactions.Extension):
                 (
                     "Icon",
                     "Server icon has been updated\n"
-                    + f"Old: {before.icon_url if before.icon else 'None'}\n"
-                    + f"New: {after.icon_url if after.icon else 'None'}",
+                    + f"Old: {before.icon if before.icon else 'None'}\n"
+                    + f"New: {after.icon if after.icon else 'None'}",
                     True,
                 )
             )
@@ -1602,8 +1606,8 @@ class Statistics(interactions.Extension):
                 (
                     "Banner",
                     "Server banner has been updated\n"
-                    + f"Old: {before.banner_url if before.banner else 'None'}\n"
-                    + f"New: {after.banner_url if after.banner else 'None'}",
+                    + f"Old: {before.banner if before.banner else 'None'}\n"
+                    + f"New: {after.banner if after.banner else 'None'}",
                     True,
                 )
             )
@@ -1613,8 +1617,8 @@ class Statistics(interactions.Extension):
                 (
                     "Invite Splash",
                     "Invite splash image has been updated\n"
-                    + f"Old: {before.splash_url if before.splash else 'None'}\n"
-                    + f"New: {after.splash_url if after.splash else 'None'}",
+                    + f"Old: {before.splash if before.splash else 'None'}\n"
+                    + f"New: {after.splash if after.splash else 'None'}",
                     True,
                 )
             )
@@ -1624,17 +1628,17 @@ class Statistics(interactions.Extension):
                 (
                     "Discovery Splash",
                     "Discovery splash image has been updated\n"
-                    + f"Old: {before.discovery_splash_url if before.discovery_splash else 'None'}\n"
-                    + f"New: {after.discovery_splash_url if after.discovery_splash else 'None'}",
+                    + f"Old: {before.discovery_splash if before.discovery_splash else 'None'}\n"
+                    + f"New: {after.discovery_splash if after.discovery_splash else 'None'}",
                     True,
                 )
             )
 
-        if before.owner_id != after.owner_id:
+        if before._owner_id != after._owner_id:
             fields.append(
                 (
                     "Ownership Transfer",
-                    f"From: <@{before.owner_id}>\nTo: <@{after.owner_id}>",
+                    f"From: <@{before._owner_id}>\nTo: <@{after._owner_id}>",
                     True,
                 )
             )
@@ -1657,18 +1661,18 @@ class Statistics(interactions.Extension):
                 )
             )
 
-        if before.default_notifications != after.default_notifications:
+        if before.default_message_notifications != after.default_message_notifications:
             fields.append(
                 (
                     "Default Notifications",
-                    f"From: {before.default_notifications}\nTo: {after.default_notifications}",
+                    f"From: {before.default_message_notifications}\nTo: {after.default_message_notifications}",
                     True,
                 )
             )
 
         if before.afk_channel_id != after.afk_channel_id:
-            before_afk = before.afk_channel.name if before.afk_channel else "None"
-            after_afk = after.afk_channel.name if after.afk_channel else "None"
+            before_afk = str(before.afk_channel_id) if before.afk_channel_id else "None"
+            after_afk = str(after.afk_channel_id) if after.afk_channel_id else "None"
             fields.append(("AFK Channel", f"From: {before_afk}\nTo: {after_afk}", True))
 
         if before.afk_timeout != after.afk_timeout:
@@ -2062,8 +2066,8 @@ class Statistics(interactions.Extension):
             (
                 "Creator",
                 (
-                    str(event.scheduled_event.creator.display_name)
-                    if event.scheduled_event.creator
+                    str(event.scheduled_event._creator.display_name)
+                    if event.scheduled_event._creator
                     else "Unknown"
                 ),
                 True,
@@ -2095,10 +2099,10 @@ class Statistics(interactions.Extension):
             ("Privacy Level", str(event.scheduled_event.privacy_level), True),
             ("Entity Type", str(event.scheduled_event.entity_type), True),
             (
-                "Channel",
+                "Channel ID",
                 (
-                    event.scheduled_event.channel.name
-                    if event.scheduled_event.channel
+                    str(event.scheduled_event._channel_id)
+                    if event.scheduled_event._channel_id
                     else "N/A"
                 ),
                 True,
@@ -2184,11 +2188,13 @@ class Statistics(interactions.Extension):
                 )
             )
 
-        if event.before and event.before.channel != event.after.channel:
+        if event.before and event.before._channel_id != event.after._channel_id:
             before_channel = (
                 event.before.channel.name if event.before.channel else "None"
             )
-            after_channel = event.after.channel.name if event.after.channel else "None"
+            after_channel = (
+                event.after._channel_id if event.after._channel_id else "None"
+            )
             fields.append(
                 ("Channel Change", f"From: {before_channel}\nTo: {after_channel}", True)
             )
@@ -2219,8 +2225,16 @@ class Statistics(interactions.Extension):
         fields.extend(
             [
                 ("Event ID", str(event.after.id), True),
-                ("Server", event.guild.name if event.guild else "Unknown", True),
-                ("Server ID", str(event.guild.id) if event.guild else "Unknown", True),
+                (
+                    "Server",
+                    (event.after.guild.name if event.after.guild else "Unknown"),
+                    True,
+                ),
+                (
+                    "Server ID",
+                    (str(event.after.guild.id) if event.after.guild else "Unknown"),
+                    True,
+                ),
                 (
                     "Updated At",
                     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -2231,7 +2245,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Server Event Updated",
-            description=(f"Scheduled event `{event.after.name}` has been modified"),
+            description=f"Scheduled event `{event.after.name}` has been modified",
             color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
@@ -2241,33 +2255,41 @@ class Statistics(interactions.Extension):
         self, event: GuildScheduledEventDelete
     ) -> EventLog:
         fields = [
-            ("Event Name", event.name, True),
-            ("Event ID", str(event.id), True),
+            ("Event Name", event.scheduled_event.name, True),
+            ("Event ID", str(event.scheduled_event.id), True),
             (
                 "Creator",
-                str(event.creator.display_name) if event.creator else "Unknown",
+                (
+                    str(event.scheduled_event.creator)
+                    if event.scheduled_event.creator
+                    else "Unknown"
+                ),
                 True,
             ),
             (
                 "Scheduled Start",
-                event.start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                event.scheduled_event.start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
                 True,
             ),
             (
                 "Scheduled End",
                 (
-                    event.end_time.strftime("%Y-%m-%d %H:%M:%S UTC")
-                    if event.end_time
+                    event.scheduled_event.end_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    if event.scheduled_event.end_time
                     else "Not specified"
                 ),
                 True,
             ),
-            ("Status", str(event.status), True),
-            ("Privacy Level", str(event.privacy_level), True),
-            ("Entity Type", str(event.entity_type), True),
+            ("Status", str(event.scheduled_event.status), True),
+            ("Privacy Level", str(event.scheduled_event.privacy_level), True),
+            ("Entity Type", str(event.scheduled_event.entity_type), True),
             (
                 "Channel",
-                event.channel.name if event.channel else "N/A",
+                (
+                    event.scheduled_event.channel_id
+                    if hasattr(event.scheduled_event, "channel_id")
+                    else "N/A"
+                ),
                 True,
             ),
             (
@@ -2275,8 +2297,24 @@ class Statistics(interactions.Extension):
                 event.location if hasattr(event, "location") else "N/A",
                 True,
             ),
-            ("Server", event.guild.name if event.guild else "Unknown", True),
-            ("Server ID", str(event.guild.id) if event.guild else "Unknown", True),
+            (
+                "Server",
+                (
+                    event.scheduled_event.guild.name
+                    if event.scheduled_event.guild
+                    else "Unknown"
+                ),
+                True,
+            ),
+            (
+                "Server ID",
+                (
+                    str(event.scheduled_event.guild.id)
+                    if event.scheduled_event.guild
+                    else "Unknown"
+                ),
+                True,
+            ),
             (
                 "Deleted At",
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -2284,22 +2322,9 @@ class Statistics(interactions.Extension):
             ),
         ]
 
-        if event.description:
-            fields.append(
-                (
-                    "Description",
-                    (
-                        event.description[:1000] + "..."
-                        if len(event.description) > 1000
-                        else event.description
-                    ),
-                    False,
-                )
-            )
-
         return EventLog(
             title="Server Event Deleted",
-            description=f"Scheduled event `{event.name}` has been cancelled",
+            description=f"Scheduled event `{event.scheduled_event.name}` has been cancelled",
             color=EmbedColor.DELETE,
             fields=tuple(fields),
         )
@@ -2308,17 +2333,25 @@ class Statistics(interactions.Extension):
     async def on_stage_instance_create(self, event: StageInstanceCreate) -> EventLog:
         fields = [
             ("Topic", event.stage_instance.topic, True),
-            ("Channel", event.stage_instance.channel.name, True), 
+            ("Channel", event.stage_instance.channel.name, True),
             ("Channel ID", str(event.stage_instance.channel.id), True),
             ("Privacy Level", str(event.stage_instance.privacy_level), True),
             (
                 "Guild",
-                event.stage_instance.guild.name if event.stage_instance.guild else "Unknown",
+                (
+                    event.stage_instance.guild.name
+                    if event.stage_instance.guild
+                    else "Unknown"
+                ),
                 True,
             ),
             (
-                "Guild ID", 
-                str(event.stage_instance.guild.id) if event.stage_instance.guild else "Unknown",
+                "Guild ID",
+                (
+                    str(event.stage_instance.guild.id)
+                    if event.stage_instance.guild
+                    else "Unknown"
+                ),
                 True,
             ),
             (
@@ -2358,12 +2391,20 @@ class Statistics(interactions.Extension):
             ("Privacy Level", str(event.stage_instance.privacy_level), True),
             (
                 "Guild",
-                event.stage_instance.guild.name if event.stage_instance.guild else "Unknown",
+                (
+                    event.stage_instance.guild.name
+                    if event.stage_instance.guild
+                    else "Unknown"
+                ),
                 True,
             ),
             (
                 "Guild ID",
-                str(event.stage_instance.guild.id) if event.stage_instance.guild else "Unknown",
+                (
+                    str(event.stage_instance.guild.id)
+                    if event.stage_instance.guild
+                    else "Unknown"
+                ),
                 True,
             ),
             (
@@ -2383,7 +2424,9 @@ class Statistics(interactions.Extension):
             )
 
         if hasattr(event.stage_instance, "scheduled_event_id"):
-            fields.append(("Linked Event ID", str(event.stage_instance.scheduled_event_id), True))
+            fields.append(
+                ("Linked Event ID", str(event.stage_instance.scheduled_event_id), True)
+            )
 
         return EventLog(
             title="Stage Instance Updated",
@@ -2397,12 +2440,28 @@ class Statistics(interactions.Extension):
     @event_handler(EventType.STAGE_INSTANCE, "Delete")
     async def on_stage_instance_delete(self, event: StageInstanceDelete) -> EventLog:
         fields = [
-            ("Topic", event.topic, True),
-            ("Channel", event.channel.name, True), 
-            ("Channel ID", str(event.channel.id), True),
-            ("Privacy Level", str(event.privacy_level), True),
-            ("Guild", event.guild.name if event.guild else "Unknown", True),
-            ("Guild ID", str(event.guild.id) if event.guild else "Unknown", True),
+            ("Topic", event.stage_instance.topic, True),
+            ("Channel", event.stage_instance.channel.name, True),
+            ("Channel ID", str(event.stage_instance.channel.id), True),
+            ("Privacy Level", str(event.stage_instance.privacy_level), True),
+            (
+                "Guild",
+                (
+                    event.stage_instance.guild.name
+                    if event.stage_instance.guild
+                    else "Unknown"
+                ),
+                True,
+            ),
+            (
+                "Guild ID",
+                (
+                    str(event.stage_instance.guild.id)
+                    if event.stage_instance.guild
+                    else "Unknown"
+                ),
+                True,
+            ),
             (
                 "Deleted At",
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -2413,7 +2472,7 @@ class Statistics(interactions.Extension):
         if hasattr(event, "discoverable_disabled"):
             fields.append(
                 (
-                    "Was Discoverable", 
+                    "Was Discoverable",
                     "No" if event.discoverable_disabled else "Yes",
                     True,
                 )
@@ -2424,7 +2483,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Stage Instance Deleted",
-            description=f"The stage instance in {event.channel.name} has been ended.",
+            description=f"The stage instance in {event.stage_instance.channel.name} has been ended.",
             color=EmbedColor.DELETE,
             fields=tuple(fields),
         )
@@ -2527,7 +2586,6 @@ class Statistics(interactions.Extension):
             ("Total Threads", str(len(event.threads)), True),
             ("Thread Members", str(len(event.members)), True),
             ("Affected Channels", str(len(event.channel_ids)), True),
-            ("Guild ID", str(event.guild_id), True),
             (
                 "Synced At",
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -2537,7 +2595,7 @@ class Statistics(interactions.Extension):
 
         thread_details = []
         for thread in event.threads[:5]:
-            member = next((m for m in event.members if m.thread_id == thread.id), None)
+            member = next((m for m in event.members if m.id == thread.id), None)
             status = "Member" if member else "Not Member"
             thread_details.append(f"{thread.name} ({status})")
 
@@ -2753,21 +2811,29 @@ class Statistics(interactions.Extension):
     @event_handler(EventType.ENTITLEMENT, "Update")
     async def on_entitlement_update(self, event: EntitlementUpdate) -> EventLog:
         fields = [
-            ("Entitlement ID", str(event.id), True),
-            ("User ID", str(event.user_id), True),
+            ("Entitlement ID", str(event.entitlement.id), True),
+            ("User ID", str(event.entitlement.user.id), True),
             (
                 "SKU ID",
-                str(event.sku_id) if event.sku_id else "Unknown",
+                (
+                    str(event.entitlement.sku_id)
+                    if event.entitlement.sku_id
+                    else "Unknown"
+                ),
                 True,
             ),
             (
                 "Application ID",
-                str(event.application_id) if event.application_id else "Unknown",
+                (
+                    str(event.entitlement.application_id)
+                    if event.entitlement.application_id
+                    else "Unknown"
+                ),
                 True,
             ),
             (
                 "Type",
-                str(event.type) if event.type else "Unknown",
+                str(event.entitlement.type) if event.entitlement.type else "Unknown",
                 True,
             ),
             (
@@ -2787,21 +2853,29 @@ class Statistics(interactions.Extension):
     @event_handler(EventType.ENTITLEMENT, "Delete")
     async def on_entitlement_delete(self, event: EntitlementDelete) -> EventLog:
         fields = [
-            ("Entitlement ID", str(event.id), True),
-            ("User ID", str(event.user_id), True),
+            ("Entitlement ID", str(event.entitlement.id), True),
+            ("User ID", str(event.entitlement.user.id), True),
             (
                 "SKU ID",
-                str(event.sku_id) if event.sku_id else "Unknown",
+                (
+                    str(event.entitlement.sku_id)
+                    if event.entitlement.sku_id
+                    else "Unknown"
+                ),
                 True,
             ),
             (
                 "Application ID",
-                str(event.application_id) if event.application_id else "Unknown",
+                (
+                    str(event.entitlement.application_id)
+                    if event.entitlement.application_id
+                    else "Unknown"
+                ),
                 True,
             ),
             (
                 "Type",
-                str(event.type) if event.type else "Unknown",
+                str(event.entitlement.type) if event.entitlement.type else "Unknown",
                 True,
             ),
             (
@@ -2821,21 +2895,29 @@ class Statistics(interactions.Extension):
     @event_handler(EventType.ENTITLEMENT, "Create")
     async def on_entitlement_create(self, event: EntitlementCreate) -> EventLog:
         fields = [
-            ("Entitlement ID", str(event.id), True),
-            ("User ID", str(event.user_id), True),
+            ("Entitlement ID", str(event.entitlement.id), True),
+            ("User ID", str(event.entitlement.user.id), True),
             (
                 "SKU ID",
-                str(event.sku_id) if event.sku_id else "Unknown",
+                (
+                    str(event.entitlement.sku_id)
+                    if event.entitlement.sku_id
+                    else "Unknown"
+                ),
                 True,
             ),
             (
                 "Application ID",
-                str(event.application_id) if event.application_id else "Unknown",
+                (
+                    str(event.entitlement.application_id)
+                    if event.entitlement.application_id
+                    else "Unknown"
+                ),
                 True,
             ),
             (
                 "Type",
-                str(event.type) if event.type else "Unknown",
+                str(event.entitlement.type) if event.entitlement.type else "Unknown",
                 True,
             ),
             (
