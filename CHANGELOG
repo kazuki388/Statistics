@@ -1,23 +1,35 @@
+## 2024-11-27
+
+### Changed
+- Updated `channel_update` to return `Optional[EventLog]`.
+
+### Fixed
+- Corrected thread member lookup to use the appropriate ID comparison (`m.id` instead of `m.thread_id`).
+- Adjusted fields formatting from tuples to lists.
+- Updated guild property access to utilize `category` instead of `parent`.
+- Fixed URL property access for guild icons and banners.
+- Revised property access for scheduled events, stage instances, and entitlements.
+
 ## 2024-11-01
 
 ### Added
-- Support for multiple event types (channels, roles, voice, etc.).
-- Role statistics tracking feature.
-- Pagination support for event logs.
-- Structured logging implemented with loguru.
-- Additional voice channel properties tracking.
-- Cleanup tasks list functionality.
-- Hash and equality methods added to InteractionRecord.
+- Introduced support for multiple event types (channels, roles, voice, etc.).
+- Implemented role statistics tracking feature.
+- Added pagination support for event logs.
+- Integrated structured logging using Loguru.
+- Enhanced tracking of additional voice channel properties.
+- Added functionality for managing cleanup tasks.
+- Implemented hash and equality methods for `InteractionRecord`.
 
 ### Changed
-- Replaced interaction tracking with event monitoring.
-- Modernized code structure using the MVC pattern.
-- Improved error handling and type safety.
-- Converted event handlers to async functions.
-- Improved permission overwrites handling in channel events.
-- Fixed voice state update event handling for member information.
-- Fixed color handling for role events.
+- Replaced interaction tracking with comprehensive event monitoring.
+- Modernized code structure following the MVC pattern.
+- Enhanced error handling and type safety.
+- Converted event handlers to asynchronous functions.
+- Improved handling of permission overwrites in channel events.
+- Fixed handling of voice state updates for member information.
+- Corrected color handling in role events.
 
 ### Fixed
-- Fixed voice state update event handling for member information.
+- Resolved issues with voice state update event handling for member information.
 - Fixed permission overwrites handling in channel events.
