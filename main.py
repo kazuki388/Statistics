@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum, auto
+from itertools import accumulate
 from logging.handlers import RotatingFileHandler
 from typing import (
     Any,
@@ -371,36 +372,47 @@ async def log_event(self, event_name: str, event_log: EventLog) -> None:
 
     async with event_logger(self, event_name):
         try:
-            async with self.send_semaphore:
+            max_retries = 3
+            base_delay = 1.0
+
+            for attempt in range(max_retries):
                 try:
-                    forum = await self.bot.fetch_channel(TRANSPARENCY_FORUM_ID)
-                    if not forum:
-                        logger.error("Could not fetch transparency forum channel")
-                        return
-
-                    post = await forum.fetch_post(LOG_POST_ID)
-                    if not post:
-                        logger.error("Could not fetch log post")
-                        return
-
-                    if post.archived:
-                        try:
-                            await post.edit(archived=False)
-                        except Exception as e:
-                            logger.error(f"Failed to unarchive post: {e}")
+                    async with self.send_semaphore:
+                        forum = await self.bot.fetch_channel(TRANSPARENCY_FORUM_ID)
+                        if not forum:
+                            logger.error("Could not fetch transparency forum channel")
                             return
 
-                    try:
+                        post = await forum.fetch_post(LOG_POST_ID)
+                        if not post:
+                            logger.error("Could not fetch log post")
+                            return
+
+                        if post.archived:
+                            try:
+                                await post.edit(archived=False)
+                            except Exception as e:
+                                logger.error(f"Failed to unarchive post: {e}")
+                                return
+
                         await post.send(embeds=embed)
                         logger.info("Successfully sent embed")
-                    except Exception as e:
-                        logger.error(f"Failed to send embed: {e}")
                         return
 
                 except Forbidden as e:
                     logger.error(f"Permission error while sending event log: {e}")
+                    return
+
                 except Exception as e:
-                    logger.error(f"Unexpected error while sending event log: {e}")
+                    if attempt == max_retries - 1:
+                        logger.error(f"Failed all retries while sending event log: {e}")
+                        return
+
+                    delay = base_delay * (2**attempt)
+                    logger.warning(
+                        f"Attempt {attempt + 1} failed, retrying in {delay}s: {e}"
+                    )
+                    await asyncio.sleep(delay)
 
         except Exception as e:
             logger.exception(f"Critical error in log_event: {e}")
@@ -1817,6 +1829,30 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
+    def chunk_field_value(self, value: str, chunk_size: int = 1024) -> list[str]:
+
+        if len(value) <= chunk_size:
+            return [value]
+
+        lines = value.split("\n")
+        line_lengths = [len(line) + 1 for line in lines]
+        cumulative_lengths = list(accumulate(line_lengths))
+
+        chunk_indices = [-1] + [
+            i for i, length in enumerate(cumulative_lengths) if length > chunk_size
+        ]
+
+        return [
+            "\n".join(chunk)
+            for chunk in (
+                lines[start + 1 : end + 1]
+                for start, end in zip(
+                    chunk_indices, chunk_indices[1:] + [len(lines) - 1]
+                )
+            )
+            if chunk
+        ]
+
     @event_handler(EventType.GUILD, "EmojisUpdate")
     async def on_guild_emojis_update(self, event: GuildEmojisUpdate) -> EventLog:
         added_emojis = [emoji for emoji in event.after if emoji not in event.before]
@@ -1852,7 +1888,11 @@ class Statistics(interactions.Extension):
                         f"Restricted to roles: {', '.join(role.name for role in emoji.roles)}"
                     )
                 emoji_details.append("\n".join(emoji_info))
-            fields.append(("Added Emojis", "\n\n".join(emoji_details), False))
+
+            chunks = self.chunk_field_value("\n\n".join(emoji_details))
+            for i, chunk in enumerate(chunks, 1):
+                suffix = f" (Part {i})" if len(chunks) > 1 else ""
+                fields.append((f"Added Emojis{suffix}", chunk, False))
 
         if removed_emojis:
             emoji_details = []
@@ -1863,7 +1903,11 @@ class Statistics(interactions.Extension):
                     f"Animated: {'Yes' if emoji.animated else 'No'}",
                 ]
                 emoji_details.append("\n".join(emoji_info))
-            fields.append(("Removed Emojis", "\n\n".join(emoji_details), False))
+
+            chunks = self.chunk_field_value("\n\n".join(emoji_details))
+            for i, chunk in enumerate(chunks, 1):
+                suffix = f" (Part {i})" if len(chunks) > 1 else ""
+                fields.append((f"Removed Emojis{suffix}", chunk, False))
 
         if modified_emojis:
             emoji_details = []
@@ -1884,8 +1928,12 @@ class Statistics(interactions.Extension):
                         f"Emoji: {new_emoji.name} ({new_emoji.id})\n"
                         + "\n".join(changes)
                     )
+
             if emoji_details:
-                fields.append(("Modified Emojis", "\n\n".join(emoji_details), False))
+                chunks = self.chunk_field_value("\n\n".join(emoji_details))
+                for i, chunk in enumerate(chunks, 1):
+                    suffix = f" (Part {i})" if len(chunks) > 1 else ""
+                    fields.append((f"Modified Emojis{suffix}", chunk, False))
 
         fields.extend(
             [
