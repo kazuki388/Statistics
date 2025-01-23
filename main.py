@@ -621,11 +621,27 @@ class Statistics(interactions.Extension):
         await ctx.send(embeds=embed)
 
     @module_base.subcommand("roles", sub_cmd_description="Get role statistics")
+    @interactions.slash_option(
+        name="role",
+        description="The role to get statistics for. Leave empty for all roles.",
+        opt_type=interactions.OptionType.ROLE,
+        required=False,
+    )
     @error_handler
-    async def role_statistics(self, ctx: interactions.SlashContext) -> None:
+    async def role_statistics(
+        self, ctx: interactions.SlashContext, role: Optional[interactions.Role] = None
+    ) -> None:
         await ctx.defer()
 
-        role_data = await self.fetch_role_counts(GUILD_ID)
+        if role:
+            role_data = [
+                RoleRecord(
+                    role_id=role.id, display_name=role.name, count=len(role.members)
+                )
+            ]
+        else:
+            role_data = await self.fetch_role_counts(GUILD_ID)
+
         embed = interactions.Embed(
             title="Role Statistics",
             color=EmbedColor.SUCCESS.value,
