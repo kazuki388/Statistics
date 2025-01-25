@@ -1349,41 +1349,41 @@ class Statistics(interactions.Extension):
 
     # Event Guild
 
-    @event_handler(EventType.GUILD, "AuditLogEntryCreate")
-    async def on_guild_audit_log_entry_create(
-        self, event: GuildAuditLogEntryCreate
-    ) -> EventLog:
-        entry = event.audit_log_entry
-        fields = [
-            ("Action Type", str(entry.action_type), True),
-            ("User ID", str(entry.user_id), True),
-            ("Target ID", str(entry.target_id), True),
-            ("Guild ID", str(event.guild_id), True),
-            (
-                "Created At",
-                format_timestamp(datetime.now(timezone.utc)),
-                True,
-            ),
-        ]
+    # @event_handler(EventType.GUILD, "AuditLogEntryCreate")
+    # async def on_guild_audit_log_entry_create(
+    #     self, event: GuildAuditLogEntryCreate
+    # ) -> EventLog:
+    #     entry = event.audit_log_entry
+    #     fields = [
+    #         ("Action Type", str(entry.action_type), True),
+    #         ("User ID", str(entry.user_id), True),
+    #         ("Target ID", str(entry.target_id), True),
+    #         ("Guild ID", str(event.guild_id), True),
+    #         (
+    #             "Created At",
+    #             format_timestamp(datetime.now(timezone.utc)),
+    #             True,
+    #         ),
+    #     ]
 
-        if entry.options:
-            fields.append(("Options", str(entry.options), True))
+    #     if entry.options:
+    #         fields.append(("Options", str(entry.options), True))
 
-        if entry.changes:
-            changes = []
-            for change in entry.changes:
-                changes.append(f"{change.key}: {change.old_value} → {change.new_value}")
-            fields.append(("Changes", "\n".join(changes), False))
+    #     if entry.changes:
+    #         changes = []
+    #         for change in entry.changes:
+    #             changes.append(f"{change.key}: {change.old_value} → {change.new_value}")
+    #         fields.append(("Changes", "\n".join(changes), False))
 
-        if entry.reason:
-            fields.append(("Reason", entry.reason, False))
+    #     if entry.reason:
+    #         fields.append(("Reason", entry.reason, False))
 
-        return EventLog(
-            title="Audit Log Entry Created",
-            description=f"A new audit log entry has been created for action {entry.action_type}",
-            color=EmbedColor.INFO,
-            fields=tuple(fields),
-        )
+    #     return EventLog(
+    #         title="Audit Log Entry Created",
+    #         description=f"A new audit log entry has been created for action {entry.action_type}",
+    #         color=EmbedColor.INFO,
+    #         fields=tuple(fields),
+    #     )
 
     @event_handler(EventType.GUILD, "MembersChunk")
     async def on_guild_members_chunk(self, event: GuildMembersChunk) -> EventLog:
@@ -2544,58 +2544,58 @@ class Statistics(interactions.Extension):
 
     # Event Thread
 
-    @event_handler(EventType.THREAD, "Update")
-    async def on_thread_update(self, event: ThreadUpdate) -> EventLog:
-        fields = []
-        thread = event.thread
+    # @event_handler(EventType.THREAD, "Update")
+    # async def on_thread_update(self, event: ThreadUpdate) -> EventLog:
+    #     fields = []
+    #     thread = event.thread
 
-        if hasattr(event, "before"):
-            before = event.before
-            if before.name != thread.name:
-                fields.append(
-                    ("Name Change", f"- From: {before.name}\n- To: {thread.name}", True)
-                )
+    #     if hasattr(event, "before"):
+    #         before = event.before
+    #         if before.name != thread.name:
+    #             fields.append(
+    #                 ("Name Change", f"- From: {before.name}\n- To: {thread.name}", True)
+    #             )
 
-            if before.archived != thread.archived:
-                fields.append(
-                    (
-                        "Archive Status",
-                        f"{'Archived' if thread.archived else 'Unarchived'}",
-                        True,
-                    )
-                )
+    #         if before.archived != thread.archived:
+    #             fields.append(
+    #                 (
+    #                     "Archive Status",
+    #                     f"{'Archived' if thread.archived else 'Unarchived'}",
+    #                     True,
+    #                 )
+    #             )
 
-            if before.locked != thread.locked:
-                fields.append(
-                    (
-                        "Lock Status",
-                        f"{'Locked' if thread.locked else 'Unlocked'}",
-                        True,
-                    )
-                )
+    #         if before.locked != thread.locked:
+    #             fields.append(
+    #                 (
+    #                     "Lock Status",
+    #                     f"{'Locked' if thread.locked else 'Unlocked'}",
+    #                     True,
+    #                 )
+    #             )
 
-        fields.extend(
-            [
-                ("Thread ID", str(thread.id), True),
-                (
-                    "Parent Channel",
-                    thread.parent_channel.name if thread.parent_channel else "Unknown",
-                    True,
-                ),
-                (
-                    "Updated At",
-                    format_timestamp(datetime.now(timezone.utc)),
-                    True,
-                ),
-            ]
-        )
+    #     fields.extend(
+    #         [
+    #             ("Thread ID", str(thread.id), True),
+    #             (
+    #                 "Parent Channel",
+    #                 thread.parent_channel.name if thread.parent_channel else "Unknown",
+    #                 True,
+    #             ),
+    #             (
+    #                 "Updated At",
+    #                 format_timestamp(datetime.now(timezone.utc)),
+    #                 True,
+    #             ),
+    #         ]
+    #     )
 
-        return EventLog(
-            title="Thread Updated",
-            description=f"Thread {thread.name} has been modified",
-            color=EmbedColor.UPDATE,
-            fields=tuple(fields),
-        )
+    #     return EventLog(
+    #         title="Thread Updated",
+    #         description=f"Thread {thread.name} has been modified",
+    #         color=EmbedColor.UPDATE,
+    #         fields=tuple(fields),
+    #     )
 
     # @event_handler(EventType.THREAD, "MembersUpdate")
     # async def on_thread_members_update(self, event: ThreadMembersUpdate) -> EventLog:
@@ -3389,63 +3389,63 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
-    @event_handler(EventType.MEMBER, "Update")
-    async def on_member_update(self, event: MemberUpdate) -> EventLog:
-        fields = []
-        before = event.before
-        after = event.after
+    # @event_handler(EventType.MEMBER, "Update")
+    # async def on_member_update(self, event: MemberUpdate) -> EventLog:
+    #     fields = []
+    #     before = event.before
+    #     after = event.after
 
-        if before.nick != after.nick:
-            fields.append(
-                (
-                    "Nickname Change",
-                    f"- From: {before.nick or 'None'}\n- To: {after.nick or 'None'}",
-                    True,
-                )
-            )
+    #     if before.nick != after.nick:
+    #         fields.append(
+    #             (
+    #                 "Nickname Change",
+    #                 f"- From: {before.nick or 'None'}\n- To: {after.nick or 'None'}",
+    #                 True,
+    #             )
+    #         )
 
-        if before.roles != after.roles:
-            added_roles = set(after.roles) - set(before.roles)
-            removed_roles = set(before.roles) - set(after.roles)
+    #     if before.roles != after.roles:
+    #         added_roles = set(after.roles) - set(before.roles)
+    #         removed_roles = set(before.roles) - set(after.roles)
 
-            if added_roles:
-                fields.append(
-                    ("Added Roles", ", ".join(role.name for role in added_roles), True)
-                )
-            if removed_roles:
-                fields.append(
-                    (
-                        "Removed Roles",
-                        ", ".join(role.name for role in removed_roles),
-                        True,
-                    )
-                )
+    #         if added_roles:
+    #             fields.append(
+    #                 ("Added Roles", ", ".join(role.name for role in added_roles), True)
+    #             )
+    #         if removed_roles:
+    #             fields.append(
+    #                 (
+    #                     "Removed Roles",
+    #                     ", ".join(role.name for role in removed_roles),
+    #                     True,
+    #                 )
+    #             )
 
-        if before.communication_disabled_until != after.communication_disabled_until:
-            fields.append(
-                (
-                    "Timeout Status",
-                    f"- From: {before.communication_disabled_until or 'None'}\n- To: {after.communication_disabled_until or 'None'}",
-                    True,
-                )
-            )
+    #     if before.communication_disabled_until != after.communication_disabled_until:
+    #         fields.append(
+    #             (
+    #                 "Timeout Status",
+    #                 f"- From: {before.communication_disabled_until or 'None'}\n- To: {after.communication_disabled_until or 'None'}",
+    #                 True,
+    #             )
+    #         )
 
-        fields.extend(
-            [
-                ("Member", after.display_name, True),
-                ("User ID", str(after.id), True),
-                ("Guild", after.guild.name, True),
-                (
-                    "Updated At",
-                    format_timestamp(datetime.now(timezone.utc)),
-                    True,
-                ),
-            ]
-        )
+    #     fields.extend(
+    #         [
+    #             ("Member", after.display_name, True),
+    #             ("User ID", str(after.id), True),
+    #             ("Guild", after.guild.name, True),
+    #             (
+    #                 "Updated At",
+    #                 format_timestamp(datetime.now(timezone.utc)),
+    #                 True,
+    #             ),
+    #         ]
+    #     )
 
-        return EventLog(
-            title="Member Updated",
-            description=f"Member {after.display_name} has been updated",
-            color=EmbedColor.UPDATE,
-            fields=tuple(fields),
-        )
+    #     return EventLog(
+    #         title="Member Updated",
+    #         description=f"Member {after.display_name} has been updated",
+    #         color=EmbedColor.UPDATE,
+    #         fields=tuple(fields),
+    #     )
