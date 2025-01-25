@@ -182,7 +182,33 @@ def find_event_class(event_name: str, action: str) -> Optional[Type[BaseEvent]]:
         "chan": "channel",
         "msg": "message",
         "sched": "scheduled",
+        "automod": "auto_mod",
+        "new_thread": "thread",
     }
+
+    special_cases: dict[str, str] = {
+        "interaction_create": "InteractionCreate",
+        "integration_delete": "IntegrationDelete",
+        "guild_audit_log_entry_create": "GuildAuditLogEntryCreate",
+        "thread_update": "ThreadUpdate",
+        "thread_members_update": "ThreadMembersUpdate",
+        "thread_member_update": "ThreadMemberUpdate",
+        "thread_delete": "ThreadDelete",
+        "new_thread_create": "ThreadCreate",
+        "thread_create": "ThreadCreate",
+        "message_reaction_remove_all": "MessageReactionRemoveAll",
+        "message_reaction_remove_emoji": "MessageReactionRemoveEmoji",
+        "automod_create": "AutoModCreated",
+        "automod_delete": "AutoModDeleted",
+        "automod_update": "AutoModUpdated",
+        "presence_update": "PresenceUpdate",
+        "member_add": "MemberAdd",
+        "member_remove": "MemberRemove",
+        "member_update": "MemberUpdate",
+    }
+
+    if event_name in special_cases:
+        return event_class_mapping.get(special_cases[event_name])
 
     words: tuple[str, ...] = tuple(
         filter(
@@ -1330,7 +1356,6 @@ class Statistics(interactions.Extension):
         entry = event.audit_log_entry
         fields = [
             ("Action Type", str(entry.action_type), True),
-            ("Target Type", str(entry.target_type), True),
             ("User ID", str(entry.user_id), True),
             ("Target ID", str(entry.target_id), True),
             ("Guild ID", str(event.guild_id), True),
@@ -1340,6 +1365,9 @@ class Statistics(interactions.Extension):
                 True,
             ),
         ]
+
+        if entry.options:
+            fields.append(("Options", str(entry.options), True))
 
         if entry.changes:
             changes = []
@@ -2696,7 +2724,6 @@ class Statistics(interactions.Extension):
             ("Member Count", str(event.thread.member_count), True),
             ("Archived", "Yes" if event.thread.archived else "No", True),
             ("Locked", "Yes" if event.thread.locked else "No", True),
-            ("Invitable", "Yes" if event.thread.invitable else "No", True),
             (
                 "Created At",
                 (
