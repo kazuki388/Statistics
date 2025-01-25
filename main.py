@@ -1175,7 +1175,7 @@ class Statistics(interactions.Extension):
         if after and after.member:
             fields.extend(
                 [
-                    ("User", after.member.display_name, True),
+                    ("User", after.member.mention, True),
                     ("User ID", str(after.member.id), True),
                     (
                         "Nickname",
@@ -1210,7 +1210,7 @@ class Statistics(interactions.Extension):
 
             return EventLog(
                 title="Voice State Updated",
-                description=f"Voice state changes detected for {after.member.display_name}",
+                description=f"Voice state changes detected for {after.member.mention}",
                 color=EmbedColor.UPDATE,
                 fields=tuple(fields),
             )
@@ -1404,7 +1404,7 @@ class Statistics(interactions.Extension):
             fields.append(("Presences Count", str(len(event.presences)), True))
 
         member_samples = [
-            f"{member.display_name} ({member.id})" for member in event.members[:5]
+            f"{member.mention} ({member.id})" for member in event.members[:5]
         ]
         if member_samples:
             fields.append(("Sample Members", "\n".join(member_samples), False))
@@ -2031,7 +2031,7 @@ class Statistics(interactions.Extension):
             fields.append(("Event Name", event.scheduled_event.name, True))
 
         if event.member:
-            fields.append(("Member Name", event.member.display_name, True))
+            fields.append(("Member Name", event.member.mention, True))
 
         return EventLog(
             title="User Removed from Scheduled Event",
@@ -2062,7 +2062,7 @@ class Statistics(interactions.Extension):
             fields.append(("Event Name", event.scheduled_event.name, True))
 
         if event.member:
-            fields.append(("Member Name", event.member.display_name, True))
+            fields.append(("Member Name", event.member.mention, True))
 
         return EventLog(
             title="User Added to Scheduled Event",
@@ -2742,7 +2742,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="New Thread Created",
-            description=f"A new thread `{event.thread.name}` has been created",
+            description=f"A new thread `{event.thread.mention}` has been created",
             color=EmbedColor.CREATE,
             fields=tuple(fields),
         )
@@ -2775,7 +2775,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Thread Created",
-            description=f"New thread {event.thread.name} has been created",
+            description=f"New thread {event.thread.mention} has been created",
             color=EmbedColor.CREATE,
             fields=tuple(fields),
         )
@@ -3320,7 +3320,7 @@ class Statistics(interactions.Extension):
     @event_handler(EventType.MEMBER, "Add")
     async def on_member_add(self, event: MemberAdd) -> EventLog:
         fields = [
-            ("Member", event.member.display_name, True),
+            ("Member", event.member.mention, True),
             ("User ID", str(event.member.id), True),
             ("Bot Account", "Yes" if event.member.bot else "No", True),
             ("Guild", event.member.guild.name, True),
@@ -3338,7 +3338,7 @@ class Statistics(interactions.Extension):
             (
                 "Assigned Roles",
                 (
-                    ", ".join(f"@{role.name}" for role in event.member.roles)
+                    ", ".join(f"{role.mention}" for role in event.member.roles)
                     if event.member.roles
                     else "None"
                 ),
@@ -3348,7 +3348,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Member Joined",
-            description=f"{event.member.display_name} has joined {event.member.guild.name}",
+            description=f"{event.member.mention} has joined {event.member.guild.name}",
             color=EmbedColor.CREATE,
             fields=tuple(fields),
         )
@@ -3356,7 +3356,7 @@ class Statistics(interactions.Extension):
     @event_handler(EventType.MEMBER, "Remove")
     async def on_member_remove(self, event: MemberRemove) -> EventLog:
         fields = [
-            ("Member", event.member.display_name, True),
+            ("Member", event.member.mention, True),
             ("User ID", str(event.member.id), True),
             ("Bot Account", "Yes" if event.member.bot else "No", True),
             ("Guild", event.member.guild.name, True),
@@ -3374,7 +3374,7 @@ class Statistics(interactions.Extension):
             (
                 "Previous Roles",
                 (
-                    ", ".join(f"@{role.name}" for role in event.member.roles)
+                    ", ".join(f"{role.mention}" for role in event.member.roles)
                     if event.member.roles
                     else "None"
                 ),
@@ -3384,7 +3384,7 @@ class Statistics(interactions.Extension):
 
         return EventLog(
             title="Member Left",
-            description=f"{event.member.display_name} has left {event.member.guild.name}",
+            description=f"{event.member.mention} has left {event.member.guild.name}",
             color=EmbedColor.DELETE,
             fields=tuple(fields),
         )
