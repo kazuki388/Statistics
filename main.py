@@ -6,7 +6,6 @@ import logging
 import os
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum, auto
@@ -17,20 +16,18 @@ from typing import (
     AsyncGenerator,
     Awaitable,
     Callable,
-    Deque,
-    Dict,
-    List,
     Optional,
     Type,
     TypeGuard,
     TypeVar,
 )
 
-import aiofiles
 import interactions
-import orjson
 from interactions.api.events import (
+    AutoModCreated,
+    AutoModDeleted,
     AutoModExec,
+    AutoModUpdated,
     BanCreate,
     BanRemove,
     BaseEvent,
@@ -40,7 +37,7 @@ from interactions.api.events import (
     EntitlementCreate,
     EntitlementDelete,
     EntitlementUpdate,
-    ExtensionLoad,
+    GuildAuditLogEntryCreate,
     GuildAvailable,
     GuildEmojisUpdate,
     GuildMembersChunk,
@@ -52,17 +49,30 @@ from interactions.api.events import (
     GuildStickersUpdate,
     GuildUnavailable,
     GuildUpdate,
+    IntegrationDelete,
+    InteractionCreate,
     InviteCreate,
     InviteDelete,
+    MemberAdd,
+    MemberRemove,
+    MemberUpdate,
     MessageDeleteBulk,
-    MessageReactionAdd,
+    MessageReactionRemoveAll,
+    MessageReactionRemoveEmoji,
+    NewThreadCreate,
+    PresenceUpdate,
     RoleCreate,
     RoleDelete,
     RoleUpdate,
     StageInstanceCreate,
     StageInstanceDelete,
     StageInstanceUpdate,
+    ThreadCreate,
+    ThreadDelete,
     ThreadListSync,
+    ThreadMembersUpdate,
+    ThreadMemberUpdate,
+    ThreadUpdate,
     VoiceStateUpdate,
     VoiceUserDeafen,
     VoiceUserMove,
@@ -92,45 +102,14 @@ logger.addHandler(file_handler)
 
 
 GUILD_ID: int = 1150630510696075404
-MONITORED_FORUM_ID: int = 1155914521907568740
-EXCLUDED_CATEGORY_ID: int = 1193393448393379980
-TRANSPARENCY_FORUM_ID: int = 1159097493875871784
-STATS_POST_ID: int = 1279118897454252146
 LOG_POST_ID: int = 1325002367875285083
-MAX_INTERACTIONS: int = 100
-STATS_FILE_PATH: str = f"{os.path.dirname(__file__)}/stats.json"
-LOG_ROTATION_THRESHOLD: int = 1 << 20
-MONITORED_ROLE_IDS: frozenset[int] = frozenset(
-    {
-        1200043628899356702,
-        1164761892015833129,
-        1196405836206059621,
-        1200046515046060052,
-        1200050048906571816,
-        1200050080359649340,
-        1200050211821719572,
-        1207524248558772264,
-        1261328929013108778,
-        1277238162095345809,
-    }
-)
+LOG_FORUM_ID: int = 1159097493875871784
+ROLE_POST_ID: int = 1325394043177275445
+THREAD_POST_ID: int = 1325393614343376916
+MEMBER_POST_ID: int = 1332687058199642112
 
 T = TypeVar("T", covariant=True)
 AsyncFunc = Callable[..., T]
-
-
-@dataclass
-class InteractionRecord:
-    thread_id: int
-    member_id: int
-
-    def __hash__(self) -> int:
-        return hash((self.thread_id, self.member_id))
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, InteractionRecord):
-            return NotImplemented
-        return (self.thread_id, self.member_id) == (other.thread_id, other.member_id)
 
 
 @dataclass
@@ -161,8 +140,11 @@ class EventLog:
 class EventType(IntEnum):
     CHANNEL = auto()
     ROLE = auto()
+    MEMBER = auto()
+    PRESENCE = auto()
     VOICE = auto()
     GUILD = auto()
+    INTERACTION = auto()
     INVITE = auto()
     BAN = auto()
     SCHEDULED_EVENT = auto()
@@ -176,28 +158,9 @@ class EventType(IntEnum):
     ENTITLEMENT = auto()
 
 
-async def rotate_file(file_path: str) -> None:
-    if not isinstance(file_path, str) or not file_path.strip():
-        raise ValueError("file_path must be a non-empty string")
-
-    try:
-        loop = asyncio.get_running_loop()
-        file_stats = await loop.run_in_executor(None, os.stat, file_path)
-
-        if file_stats.st_size <= LOG_ROTATION_THRESHOLD:
-            return
-
-        await loop.run_in_executor(None, os.remove, file_path)
-        logger.info("Deleted old file %s", file_path)
-
-        async with aiofiles.open(file_path, mode="wb") as f:
-            await f.write(b"{}")
-            await loop.run_in_executor(None, os.fsync, f.fileno())
-            await loop.run_in_executor(None, os.chmod, file_path, 0o644)
-
-    except OSError as e:
-        logger.error("Failed to rotate %s: %s", file_path, str(e))
-        raise OSError(f"File rotation failed: {str(e)}") from e
+def format_timestamp(dt: datetime) -> str:
+    unix_ts = int(dt.timestamp())
+    return f"<t:{unix_ts}:F> (<t:{unix_ts}:R>)"
 
 
 # Check methods
@@ -227,10 +190,18 @@ def find_event_class(event_name: str, action: str) -> Optional[Type[BaseEvent]]:
         )
     )
 
+    def capitalize_words(words_list: list[str]) -> str:
+        if not words_list:
+            return ""
+        return "".join(word.capitalize() for word in words_list)
+
+    def filter_words(predicate: Callable[[str], bool]) -> str:
+        return capitalize_words([w for w in words if predicate(w)])
+
     name_variants: tuple[str, ...] = (
-        "".join(map(str.capitalize, words)),
-        "".join(map(str.capitalize, (w for w in words if w != "channel"))),
-        f"{action.capitalize()}{''.join(map(str.capitalize, (w for w in words if w != action.lower())))}",
+        capitalize_words(list(words)),
+        filter_words(lambda w: w != "channel"),
+        f"{action.capitalize()}{filter_words(lambda w: w != action.lower())}",
         f"{action.capitalize()}{words[0].capitalize()}",
         f"{words[-1].capitalize()}{action.capitalize()}",
         f"{''.join(w[0].upper() for w in words)}{action.capitalize()}",
@@ -341,15 +312,11 @@ def error_handler(func: AsyncFunc[T]) -> Callable[..., Awaitable[Optional[T]]]:
 
 
 def create_embed(event_log: EventLog) -> interactions.Embed:
-    if not isinstance(event_log, EventLog):
-        logger.error("Expected EventLog, got %s", type(event_log).__name__)
-        raise ValueError(f"Expected EventLog, got {type(event_log).__name__}")
-
     return interactions.Embed(
         title=event_log.title,
         description=event_log.description,
         color=event_log.color.value,
-        timestamp=datetime.now(timezone.utc).astimezone(),
+        timestamp=interactions.Timestamp.now(timezone.utc),
         fields=[
             interactions.EmbedField(
                 name=str(name),
@@ -370,6 +337,14 @@ async def log_event(self, event_name: str, event_log: EventLog) -> None:
 
     embed = await asyncio.to_thread(create_embed, event_log)
 
+    post_id = LOG_POST_ID
+    if event_name.startswith("ROLE"):
+        post_id = ROLE_POST_ID
+    elif event_name.startswith("THREAD"):
+        post_id = THREAD_POST_ID
+    elif event_name.startswith("MEMBER"):
+        post_id = MEMBER_POST_ID
+
     async with event_logger(self, event_name):
         try:
             max_retries = 3
@@ -378,12 +353,12 @@ async def log_event(self, event_name: str, event_log: EventLog) -> None:
             for attempt in range(max_retries):
                 try:
                     async with self.send_semaphore:
-                        forum = await self.bot.fetch_channel(TRANSPARENCY_FORUM_ID)
+                        forum = await self.bot.fetch_channel(LOG_FORUM_ID)
                         if not forum:
                             logger.error("Could not fetch transparency forum channel")
                             return
 
-                        post = await forum.fetch_post(LOG_POST_ID)
+                        post = await forum.fetch_post(post_id)
                         if not post:
                             logger.error("Could not fetch log post")
                             return
@@ -467,79 +442,7 @@ async def event_logger(self, event_name: str) -> AsyncGenerator[None, None]:
 class Statistics(interactions.Extension):
     def __init__(self, bot: interactions.Client) -> None:
         self.bot: interactions.Client = bot
-        self.recent_interactions: Deque[InteractionRecord] = deque(
-            maxlen=MAX_INTERACTIONS, iterable=[]
-        )
-        self.interaction_count_history: Deque[int] = deque(
-            maxlen=MAX_INTERACTIONS, iterable=[0] * MAX_INTERACTIONS
-        )
-        self.timestamp_history: Deque[str] = deque(
-            maxlen=MAX_INTERACTIONS, iterable=[""] * MAX_INTERACTIONS
-        )
-
-        self.role_counts: Dict[int, int] = {
-            role_id: 0 for role_id in MONITORED_ROLE_IDS
-        }
-
-        self._cleanup_tasks: List[asyncio.Task] = []
-        self.update_lock: asyncio.Lock = asyncio.Lock()
-        self.stats_message: Optional[interactions.Message] = None
         self.send_semaphore: asyncio.Semaphore = asyncio.Semaphore(5)
-
-    # Tasks
-
-    @interactions.Task.create(interactions.IntervalTrigger(hours=1))
-    async def check_log_rotation(self) -> None:
-        try:
-            await rotate_file(STATS_FILE_PATH)
-        except Exception as e:
-            logger.error(f"Failed to rotate files: {e}")
-
-    @interactions.Task.create(interactions.IntervalTrigger(hours=12))
-    async def update_interactions_daily(self) -> None:
-        async with self.update_lock:
-            self.timestamp_history.append(
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            )
-
-            if not (
-                target_forum := await self.fetch_monitored_forum(MONITORED_FORUM_ID)
-            ):
-                logger.error("Target forum not found during daily update")
-                return
-            current_valid_interactions = await self.fetch_current_interactions(
-                target_forum
-            )
-            if not current_valid_interactions:
-                logger.error("No valid interactions found during daily update")
-                return
-
-            current_set = set(await current_valid_interactions)
-            existing_set = set(self.recent_interactions)
-            new_interactions = tuple(current_set - existing_set)
-
-            self.recent_interactions.extend(new_interactions)
-            self.interaction_count_history.append(len(new_interactions))
-
-            log_data = (
-                tuple(self.interaction_count_history),
-                tuple(self.timestamp_history),
-                tuple((role_id, count) for role_id, count in self.role_counts.items()),
-            )
-
-            logger.info("Interactions: %s, Datetimes: %s", log_data[0], log_data[1])
-            logger.info("Role counts: %s", dict(log_data[2]))
-
-    @interactions.Task.create(interactions.IntervalTrigger(hours=12))
-    async def update_stats_daily(self) -> None:
-        try:
-            async with asyncio.timeout(30):
-                async with self.update_lock:
-                    await self.update_stats_message()
-        except TimeoutError:
-            logger.error("update_stats_daily timed out after 30 seconds")
-        except Exception as e:
-            logger.error("Error in update_stats_daily: %s", str(e))
 
     # Commands
 
@@ -547,85 +450,12 @@ class Statistics(interactions.Extension):
         name="stats", description="Activities statistics"
     )
 
-    @module_base.subcommand("forum", sub_cmd_description="Get forum activities")
-    @interactions.slash_option(
-        name="channel",
-        description="Select a forum channel to analyze",
-        opt_type=interactions.OptionType.CHANNEL,
-        required=True,
-    )
-    @error_handler
-    async def forum_activities(
-        self, ctx: interactions.SlashContext, channel: interactions.GuildChannel
-    ) -> None:
-        await ctx.defer()
-
-        if not isinstance(channel, interactions.GuildForum):
-            await ctx.send(
-                embeds=(
-                    interactions.Embed(
-                        title="Error",
-                        description="The selected channel is not a forum channel.",
-                        color=EmbedColor.ERROR,
-                    )
-                )
-            )
-            return
-
-        embed = (
-            await self._get_monitored_forum_stats(channel)
-            if channel.id == MONITORED_FORUM_ID
-            else await self._get_realtime_forum_stats(channel)
-        )
-        await ctx.send(embeds=embed)
-
-    @module_base.subcommand("guild", sub_cmd_description="Get guild statistics")
-    @error_handler
-    async def guild_statistics(self, ctx: interactions.SlashContext) -> None:
-        await ctx.defer()
-
-        guild = await self.bot.fetch_guild(GUILD_ID)
-
-        stats = {
-            attr: (
-                len(getattr(guild, attr))
-                if attr in ("bots", "channels", "roles")
-                else getattr(guild, attr)
-            )
-            for attr in (
-                "bots",
-                "channels",
-                "member_count",
-                "max_members",
-                "max_presences",
-                "roles",
-            )
-        }
-
-        embed = interactions.Embed(
-            title="Guild Statistics",
-            color=EmbedColor.SUCCESS.value,
-            fields=[
-                interactions.EmbedField(
-                    name=f"{name.replace('_', ' ').title()}",
-                    value=str(value),
-                    inline=True,
-                )
-                for name, value in stats.items()
-            ],
-            footer=interactions.EmbedFooter(
-                text=f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
-            ),
-        )
-
-        await ctx.send(embeds=embed)
-
     @module_base.subcommand("roles", sub_cmd_description="Get role statistics")
     @interactions.slash_option(
         name="role",
         description="The role to get statistics for. Leave empty for all roles.",
         opt_type=interactions.OptionType.ROLE,
-        required=False,
+        required=True,
     )
     @error_handler
     async def role_statistics(
@@ -633,321 +463,71 @@ class Statistics(interactions.Extension):
     ) -> None:
         await ctx.defer()
 
-        if role:
-            role_data = [
+        role_data = (
+            [
                 RoleRecord(
-                    role_id=role.id, display_name=role.name, count=len(role.members)
+                    role_id=role.id,
+                    display_name=role.name,
+                    count=sum(1 for _ in role.members),
                 )
             ]
-        else:
-            role_data = await self.fetch_role_counts(GUILD_ID)
+            if role
+            else []
+        )
 
         embed = interactions.Embed(
             title="Role Statistics",
             color=EmbedColor.SUCCESS.value,
             fields=[
                 interactions.EmbedField(
-                    name=f"Role {role.display_name}",
-                    value=f"Count: {role.count}",
+                    name=f"Role {r.display_name}",
+                    value=f"Count: {r.count}",
                     inline=False,
                 )
-                for role in role_data
+                for r in role_data
             ],
             footer=interactions.EmbedFooter(
                 text=f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
             ),
         )
 
-        await ctx.send(embeds=embed)
+        await ctx.send(embeds=[embed])
 
-    @module_base.subcommand("export", sub_cmd_description="Export statistics")
-    @error_handler
-    async def export_stats(self, ctx: interactions.SlashContext) -> None:
-        await ctx.defer()
-
-        temp_file_path = (
-            f"{os.path.dirname(__file__)}/temp_stats_{int(time.time_ns())}.json"
-        )
-
-        try:
-            if not os.path.exists(STATS_FILE_PATH):
-                default_stats = {
-                    "interaction_count_history": list(self.interaction_count_history),
-                    "timestamp_history": list(self.timestamp_history),
-                    "role_counts": {
-                        str(role_id): count
-                        for role_id, count in self.role_counts.items()
-                    },
-                }
-                async with aiofiles.open(STATS_FILE_PATH, mode="w") as f:
-                    await f.write(orjson.dumps(default_stats).decode())
-
-            async with aiofiles.open(STATS_FILE_PATH, mode="rb") as f:
-                content = await f.read()
-
-            try:
-                orjson.loads(content)
-            except orjson.JSONDecodeError:
-                await ctx.send(
-                    embeds=interactions.Embed(
-                        title="Error",
-                        description="The stats file is corrupted. Creating a new one.",
-                        color=EmbedColor.ERROR,
-                    )
-                )
-                return
-
-            async with aiofiles.open(temp_file_path, mode="wb") as temp_file:
-                await temp_file.write(content)
-                await temp_file.flush()
-                os.fsync(temp_file.fileno())
-
-            await ctx.send(file=interactions.File(temp_file_path))
-
-        except Exception as e:
-            await ctx.send(
-                embeds=interactions.Embed(
-                    title="Error",
-                    description=f"Failed to export stats: {str(e)}",
-                    color=EmbedColor.ERROR,
-                )
-            )
-            logger.error(f"Failed to export stats: {e}")
-
-        finally:
-            if os.path.exists(temp_file_path):
-                await asyncio.to_thread(os.unlink, temp_file_path)
-
-    # Serve
-
-    async def fetch_monitored_forum(
-        self, forum_id: int
-    ) -> Optional[interactions.GuildForum]:
-        channels = await (await self.bot.fetch_guild(GUILD_ID)).fetch_channels()
-        for channel in channels:
-            if isinstance(channel, interactions.GuildForum) and channel.id == forum_id:
-                return channel
-        return None
-
-    @error_handler
-    async def fetch_current_interactions(
-        self, target_forum: interactions.GuildForum
-    ) -> List[InteractionRecord]:
-        interactions_set: set[InteractionRecord] = set()
-
-        try:
-            if not (threads := await target_forum.fetch_posts()):
-                logger.error("Failed to fetch posts: No threads returned")
-                return []
-
-            for thread in threads:
-                try:
-                    if not (thread_members := await thread.fetch_members()):
-                        logger.warning(f"No members found for thread {thread.id}")
-                        continue
-
-                    interactions_set.update(
-                        InteractionRecord(thread.id, member.id)
-                        for member in thread_members
-                    )
-
-                    async for message in thread.history():
-                        if not message.reactions:
-                            continue
-
-                        for reaction in message.reactions:
-                            async for user in reaction.users():
-                                interactions_set.add(
-                                    InteractionRecord(thread.id, user.id)
-                                )
-
-                except Exception as e:
-                    logger.error(f"Error processing thread {thread.id}: {e}")
-                    continue
-
-        except Exception as e:
-            logger.error(f"Failed to fetch interactions: {e}")
-            return []
-
-        return list(interactions_set)
-
-    @staticmethod
-    async def _get_monitored_forum_stats(
-        channel: interactions.GuildForum,
-    ) -> interactions.Embed:
-        async with aiofiles.open(STATS_FILE_PATH) as f:
-            interaction_data: dict = orjson.loads(await f.read())
-
-        recent_data = tuple(
-            zip(
-                interaction_data["timestamp_history"][-10:],
-                interaction_data["interaction_count_history"][-10:],
-            )
-        )
-
-        return interactions.Embed(
-            title=f"Forum Activities for {channel.name} (Last 10 Entries)",
-            color=EmbedColor.SUCCESS,
-            fields=[
-                interactions.EmbedField(
-                    name=dt, value=f"Activities: {count}", inline=True
-                )
-                for dt, count in recent_data
-            ],
-        )
-
-    async def _get_realtime_forum_stats(
-        self, channel: interactions.GuildForum
-    ) -> interactions.Embed:
-        current_valid_interactions = await self.fetch_current_interactions(channel)
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        return interactions.Embed(
-            title=f"Real-time Forum Activities for {channel.name}",
-            color=0x00FF00,
-            fields=[
-                interactions.EmbedField(
-                    name="Timestamp",
-                    value=current_time,
-                    inline=True,
-                ),
-                interactions.EmbedField(
-                    name="Interaction Count",
-                    value=str(
-                        len(
-                            await current_valid_interactions
-                            if current_valid_interactions
-                            else []
-                        )
-                    ),
-                    inline=True,
-                ),
-            ],
-        )
-
-    async def fetch_role_counts(self, guild_id: int) -> List[RoleRecord]:
-        guild = await self.bot.fetch_guild(guild_id)
-        roles = {
-            role_id: await guild.fetch_role(role_id) for role_id in MONITORED_ROLE_IDS
-        }
-        return [
-            RoleRecord(role_id=role_id, display_name=role.name, count=len(role.members))
-            for role_id, role in roles.items()
-            if role is not None
-        ]
-
-    async def update_stats_message(self) -> None:
-        guild = await self.bot.fetch_guild(GUILD_ID)
-        forum = await guild.fetch_channel(TRANSPARENCY_FORUM_ID)
-
-        try:
-            post = await forum.fetch_post(STATS_POST_ID)
-        except Exception as e:
-            logger.error(f"Failed to fetch post {STATS_POST_ID}: {e}")
-            return
-
-        if not post:
-            logger.error(f"Post {STATS_POST_ID} not found")
-            return
-
-        embed = interactions.Embed(title="Guild Statistics", color=EmbedColor.SUCCESS)
-
-        stats = {
-            "Bot Count": len(guild.bots),
-            "Channel Count": len(guild.channels),
-            "Member Count": guild.member_count,
-            "Max Members": guild.max_members,
-            "Max Presences": guild.max_presences,
-            "Role Count": len(guild.roles),
-        }
-
-        for name, value in stats.items():
-            embed.add_field(name=name, value=str(value), inline=True)
-
-        role_data = await self.fetch_role_counts(GUILD_ID)
-        for role in role_data:
-            embed.add_field(
-                name=f"{role.display_name} Count", value=str(role.count), inline=True
-            )
-
-        current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        embed.set_footer(text=f"Last updated: {current_time}")
-        try:
-            if self.stats_message:
-                await self.stats_message.edit(embeds=[embed])
-                await post.send(f"Statistics updated at {current_time}.")
-            else:
-                self.stats_message = await post.send(embeds=[embed])
-        except Exception as e:
-            logger.error(f"Failed to update stats message: {e}")
-
-    # Listeners
-
-    @interactions.listen(MessageReactionAdd)
-    async def on_reaction_add(self, event: MessageReactionAdd) -> None:
-        if event.message.channel.parent_id != MONITORED_FORUM_ID:
-            return
-
-        if event.reaction_count > 1:
-            return
-
-        async with self.update_lock:
-            new_interaction = InteractionRecord(
-                event.message.channel.id, event.author.id
-            )
-            if new_interaction in self.recent_interactions:
-                return
-
-            self.recent_interactions.append(new_interaction)
-            self.interaction_count_history.append(1)
-            self.timestamp_history.append(
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            )
-
-    @interactions.listen(ExtensionLoad)
-    async def on_load(self, event: ExtensionLoad) -> None:
-        self.check_log_rotation.start()
-        self.update_interactions_daily.start()
-        self.update_stats_daily.start()
-
-    # Event
+    # Event Channel
 
     @event_handler(EventType.CHANNEL, "Create")
     async def on_channel_create(self, event: ChannelCreate) -> EventLog:
         channel = event.channel
         channel_type = str(channel.type).replace("_", " ").title()
-        created_timestamp = channel.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        created_timestamp = format_timestamp(datetime.now(timezone.utc))
 
-        parent_channel = None
-        if hasattr(channel, "parent_id") and channel.parent_id:
-            try:
-                parent_channel = await self.bot.fetch_channel(channel.parent_id)
-            except Exception:
-                pass
+        parent_channel = (
+            await self.bot.fetch_channel(channel.parent_id)
+            if hasattr(channel, "parent_id") and channel.parent_id
+            else None
+        )
 
-        category_name = parent_channel.name if parent_channel else "None"
-        category_id = str(parent_channel.id) if parent_channel else "N/A"
+        category_name, category_id = (
+            (parent_channel.name, str(parent_channel.id))
+            if parent_channel
+            else ("None", "N/A")
+        )
 
-        permission_details = []
-        for overwrite in channel.permission_overwrites:
-            target_type = "Role" if overwrite.type == 0 else "Member"
-            allow_perms = [p for p in overwrite.allow] if overwrite.allow else []
-            deny_perms = [p for p in overwrite.deny] if overwrite.deny else []
-
-            if allow_perms or deny_perms:
-                permission_details.append(
-                    f"{target_type} {overwrite.id}:\n"
-                    + (
-                        f"  Allow: {', '.join(str(p) for p in allow_perms)}\n"
-                        if allow_perms
-                        else ""
-                    )
-                    + (
-                        f"  Deny: {', '.join(str(p) for p in deny_perms)}"
-                        if deny_perms
-                        else ""
-                    )
-                )
+        permission_details = [
+            f"{('Role' if overwrite.type == 0 else 'Member')} {overwrite.id}:\n"
+            + (
+                f"  Allow: {', '.join(map(str, overwrite.allow))}\n"
+                if overwrite.allow
+                else ""
+            )
+            + (
+                f"  Deny: {', '.join(map(str, overwrite.deny))}"
+                if overwrite.deny
+                else ""
+            )
+            for overwrite in channel.permission_overwrites
+            if overwrite.allow or overwrite.deny
+        ]
 
         fields = [
             ("Channel Name", channel.name, True),
@@ -967,26 +547,33 @@ class Statistics(interactions.Extension):
                 ),
                 True,
             ),
+            *(
+                [("Topic", channel.topic, False)]
+                if hasattr(channel, "topic") and channel.topic
+                else []
+            ),
+            *(
+                [("Bitrate", f"{channel.bitrate//1000}kbps", True)]
+                if hasattr(channel, "bitrate")
+                else []
+            ),
+            *(
+                [
+                    (
+                        "User Limit",
+                        str(channel.user_limit) if channel.user_limit > 0 else "∞",
+                        True,
+                    )
+                ]
+                if hasattr(channel, "user_limit")
+                else []
+            ),
+            *(
+                [("Permission Overwrites", "\n".join(permission_details), False)]
+                if permission_details
+                else []
+            ),
         ]
-
-        if hasattr(channel, "topic") and channel.topic:
-            fields.append(("Topic", channel.topic, False))
-
-        if hasattr(channel, "bitrate"):
-            fields.append(("Bitrate", f"{channel.bitrate//1000}kbps", True))
-        if hasattr(channel, "user_limit"):
-            fields.append(
-                (
-                    "User Limit",
-                    str(channel.user_limit) if channel.user_limit > 0 else "∞",
-                    True,
-                )
-            )
-
-        if permission_details:
-            fields.append(
-                ("Permission Overwrites", "\n".join(permission_details), False)
-            )
 
         return EventLog(
             title="Channel Created",
@@ -999,7 +586,8 @@ class Statistics(interactions.Extension):
     async def on_channel_delete(self, event: ChannelDelete) -> EventLog:
         channel = event.channel
         channel_type = str(channel.type).replace("_", " ").title()
-        deleted_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        deleted_timestamp = format_timestamp(datetime.now(timezone.utc))
+        created_timestamp = format_timestamp(channel.created_at)
         lifetime = datetime.now(timezone.utc) - channel.created_at
 
         category_name = (
@@ -1016,7 +604,7 @@ class Statistics(interactions.Extension):
             ("Category Name", category_name, True),
             ("Category ID", category_id, True),
             ("Position", str(channel.position), True),
-            ("Created At", channel.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"), True),
+            ("Created At", created_timestamp, True),
             ("Deleted At", deleted_timestamp, True),
             (
                 "Channel Age",
@@ -1063,23 +651,20 @@ class Statistics(interactions.Extension):
     @event_handler(EventType.CHANNEL, "Update")
     async def on_channel_update(self, event: ChannelUpdate) -> Optional[EventLog]:
 
-        if event.before.parent_id == EXCLUDED_CATEGORY_ID:
-            return None
-
         fields = []
         before = event.before
         after = event.after
 
         if before.name != after.name:
             fields.append(
-                ("Name Change", f"From: `{before.name}`\nTo: `{after.name}`", True)
+                ("Name Change", f"- From: `{before.name}`\n- To: `{after.name}`", True)
             )
 
         if before.type != after.type:
             fields.append(
                 (
                     "Type Change",
-                    f"From: {str(before.type).replace('_', ' ').title()}\nTo: {str(after.type).replace('_', ' ').title()}",
+                    f"- From: {str(before.type).replace('_', ' ').title()}\n- To: {str(after.type).replace('_', ' ').title()}",
                     True,
                 )
             )
@@ -1090,7 +675,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Category Change",
-                    f"From: `{before_category}` (ID: {before.parent_id or 'None'})\nTo: `{after_category}` (ID: {after.parent_id or 'None'}`)",
+                    f"- From: `{before_category}` (ID: {before.parent_id or 'None'})\n- To: `{after_category}` (ID: {after.parent_id or 'None'}`)",
                     True,
                 )
             )
@@ -1099,7 +684,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Position Change",
-                    f"From: {before.position}\nTo: {after.position}",
+                    f"- From: {before.position}\n- To: {after.position}",
                     True,
                 )
             )
@@ -1112,7 +697,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Topic Change",
-                    f"From: `{before.topic or 'None'}`\nTo: `{after.topic or 'None'}`",
+                    f"- From: `{before.topic or 'None'}`\n- To: `{after.topic or 'None'}`",
                     False,
                 )
             )
@@ -1121,7 +706,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "NSFW Status",
-                    f"From: {'Enabled' if before.nsfw else 'Disabled'}\nTo: {'Enabled' if after.nsfw else 'Disabled'}",
+                    f"- From: {'Enabled' if before.nsfw else 'Disabled'}\n- To: {'Enabled' if after.nsfw else 'Disabled'}",
                     True,
                 )
             )
@@ -1131,7 +716,7 @@ class Statistics(interactions.Extension):
                 fields.append(
                     (
                         "Slowmode Change",
-                        f"From: {before.slowmode_delay}s\nTo: {after.slowmode_delay}s",
+                        f"- From: {before.slowmode_delay}s\n- To: {after.slowmode_delay}s",
                         True,
                     )
                 )
@@ -1141,7 +726,7 @@ class Statistics(interactions.Extension):
                 fields.append(
                     (
                         "Bitrate Change",
-                        f"From: {before.bitrate//1000}kbps\nTo: {after.bitrate//1000}kbps",
+                        f"- From: {before.bitrate//1000}kbps\n- To: {after.bitrate//1000}kbps",
                         True,
                     )
                 )
@@ -1153,7 +738,7 @@ class Statistics(interactions.Extension):
                 fields.append(
                     (
                         "User Limit Change",
-                        f"From: {before_limit}\nTo: {after_limit}",
+                        f"- From: {before_limit}\n- To: {after_limit}",
                         True,
                     )
                 )
@@ -1242,7 +827,7 @@ class Statistics(interactions.Extension):
                 ("Guild ID", str(after.guild.id) if after.guild else "N/A", True),
                 (
                     "Updated At",
-                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    format_timestamp(datetime.now(timezone.utc)),
                     True,
                 ),
             ]
@@ -1255,10 +840,12 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
+    # Event Role
+
     @event_handler(EventType.ROLE, "Create")
     async def on_role_create(self, event: RoleCreate) -> EventLog:
         role = event.role
-        created_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        created_timestamp = format_timestamp(datetime.now(timezone.utc))
 
         color_hex = f"#{role.color.value:06x}" if role.color else "Default"
 
@@ -1290,7 +877,7 @@ class Statistics(interactions.Extension):
     @event_handler(EventType.ROLE, "Delete")
     async def on_role_delete(self, event: RoleDelete) -> EventLog:
         role = event.role
-        deleted_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        deleted_timestamp = format_timestamp(datetime.now(timezone.utc))
 
         if not role:
             return EventLog(
@@ -1311,6 +898,7 @@ class Statistics(interactions.Extension):
         )
 
         role_age = datetime.now(timezone.utc) - role.created_at
+        created_timestamp = format_timestamp(role.created_at)
         age_text = f"{role_age.days} days, {role_age.seconds//3600} hours"
 
         fields = [
@@ -1322,7 +910,7 @@ class Statistics(interactions.Extension):
             ("Mentionable", "Yes" if role.mentionable else "No", True),
             ("Managed", "Yes" if role.managed else "No", True),
             ("Integration", "Yes" if role.integration else "No", True),
-            ("Created At", role.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"), True),
+            ("Created At", created_timestamp, True),
             ("Deleted At", deleted_timestamp, True),
             ("Role Age", age_text, True),
             (
@@ -1350,12 +938,12 @@ class Statistics(interactions.Extension):
             before_color = f"#{before.color.value:06x}" if before.color else "Default"
             after_color = f"#{after.color.value:06x}" if after.color else "Default"
             fields.append(
-                ("Color Change", f"From: {before_color}\nTo: {after_color}", True)
+                ("Color Change", f"- From: {before_color}\n- To: {after_color}", True)
             )
 
         if before.name != after.name:
             fields.append(
-                ("Name Change", f"From: `{before.name}`\nTo: `{after.name}`", True)
+                ("Name Change", f"- From: `{before.name}`\n- To: `{after.name}`", True)
             )
 
         if before.permissions != after.permissions:
@@ -1375,7 +963,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Position Change",
-                    f"From: {before.position}\nTo: {after.position}\n"
+                    f"- From: {before.position}\n- To: {after.position}\n"
                     + f"(Moved {'up' if after.position > before.position else 'down'} "
                     + f"by {abs(after.position - before.position)} positions)",
                     True,
@@ -1386,8 +974,8 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Hoist Status",
-                    f"From: {'Hoisted' if before.hoist else 'Not hoisted'}\n"
-                    + f"To: {'Hoisted' if after.hoist else 'Not hoisted'}",
+                    f"- From: {'Hoisted' if before.hoist else 'Not hoisted'}\n"
+                    + f"- To: {'Hoisted' if after.hoist else 'Not hoisted'}",
                     True,
                 )
             )
@@ -1396,8 +984,8 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Mentionable Status",
-                    f"From: {'Mentionable' if before.mentionable else 'Not mentionable'}\n"
-                    + f"To: {'Mentionable' if after.mentionable else 'Not mentionable'}",
+                    f"- From: {'Mentionable' if before.mentionable else 'Not mentionable'}\n"
+                    + f"- To: {'Mentionable' if after.mentionable else 'Not mentionable'}",
                     True,
                 )
             )
@@ -1406,8 +994,8 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Managed Status",
-                    f"From: {'Managed' if before.managed else 'Not managed'}\n"
-                    + f"To: {'Managed' if after.managed else 'Not managed'}",
+                    f"- From: {'Managed' if before.managed else 'Not managed'}\n"
+                    + f"- To: {'Managed' if after.managed else 'Not managed'}",
                     True,
                 )
             )
@@ -1416,8 +1004,8 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Integration Status",
-                    f"From: {'Integrated' if before.integration else 'Not integrated'}\n"
-                    + f"To: {'Integrated' if after.integration else 'Not integrated'}",
+                    f"- From: {'Integrated' if before.integration else 'Not integrated'}\n"
+                    + f"- To: {'Integrated' if after.integration else 'Not integrated'}",
                     True,
                 )
             )
@@ -1434,7 +1022,7 @@ class Statistics(interactions.Extension):
                 ),
                 (
                     "Updated At",
-                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    format_timestamp(datetime.now(timezone.utc)),
                     True,
                 ),
             ]
@@ -1447,12 +1035,14 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
+    # Event Voice
+
     @event_handler(EventType.VOICE, "StateUpdate")
     async def on_voice_state_update(self, event: VoiceStateUpdate) -> EventLog:
         fields = []
         before = event.before
         after = event.after
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        timestamp = format_timestamp(datetime.now(timezone.utc))
 
         if before and after and before.channel != after.channel:
             before_channel = before.channel.name if before.channel else "None"
@@ -1469,8 +1059,8 @@ class Statistics(interactions.Extension):
                 (
                     "Channel Change",
                     f"User {action} voice channels\n"
-                    + f"From: `{before_channel}`\n"
-                    + f"To: `{after_channel}`",
+                    + f"- From: `{before_channel}`\n"
+                    + f"- To: `{after_channel}`",
                     True,
                 )
             )
@@ -1547,7 +1137,7 @@ class Statistics(interactions.Extension):
                 fields.append(
                     (
                         "Speaking Request",
-                        f"User requested to speak at {after.request_to_speak_timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                        f"User requested to speak at {format_timestamp(after.request_to_speak_timestamp)}",
                         True,
                     )
                 )
@@ -1606,16 +1196,238 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
+    @event_handler(EventType.VOICE, "UserMute")
+    async def on_voice_user_mute(self, event: VoiceUserMute) -> EventLog:
+        action = "muted" if event.mute else "unmuted"
+        fields = [
+            ("User", event.author.display_name, True),
+            ("User ID", str(event.author.id), True),
+            ("Channel", event.channel.name, True),
+            ("Channel ID", str(event.channel.id), True),
+            ("Action", action.capitalize(), True),
+            (
+                "Timestamp",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title=f"User {action.capitalize()} in Voice Channel",
+            description=f"{event.author.display_name} was {action} in voice channel {event.channel.name}.",
+            color=EmbedColor.UPDATE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.VOICE, "UserMove")
+    async def on_voice_user_move(self, event: VoiceUserMove) -> EventLog:
+        guild = event.new_channel.guild if event.new_channel else None
+
+        fields = [
+            ("User", event.author.display_name, True),
+            ("User ID", str(event.author.id), True),
+            ("- From Channel", event.previous_channel.name, True),
+            ("- From Channel ID", str(event.previous_channel.id), True),
+            ("To Channel", event.new_channel.name, True),
+            ("To Channel ID", str(event.new_channel.id), True),
+            ("Guild", guild.name if guild else "Unknown", True),
+            ("Guild ID", str(guild.id) if guild else "Unknown", True),
+            (
+                "Moved At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title="User Moved Voice Channels",
+            description=f"{event.author.display_name} was moved from {event.previous_channel.name} to {event.new_channel.name}.",
+            color=EmbedColor.UPDATE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.VOICE, "UserDeafen")
+    async def on_voice_user_deafen(self, event: VoiceUserDeafen) -> EventLog:
+        action = "deafened" if event.deaf else "undeafened"
+        fields = [
+            ("User", event.author.display_name, True),
+            ("User ID", str(event.author.id), True),
+            ("Channel", event.channel.name, True),
+            ("Channel ID", str(event.channel.id), True),
+            ("Action", action.capitalize(), True),
+            (
+                "Timestamp",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title=f"User {action.capitalize()} in Voice Channel",
+            description=f"{event.author.display_name} was {action} in voice channel {event.channel.name}.",
+            color=EmbedColor.UPDATE,
+            fields=tuple(fields),
+        )
+
+    # Event Interaction
+
+    @event_handler(EventType.INTERACTION, "Create")
+    async def on_interaction_create(self, event: InteractionCreate) -> EventLog:
+        fields = [
+            ("Type", str(event.interaction["type"]), True),
+            ("User", event.interaction["user"]["display_name"], True),
+            ("User ID", str(event.interaction["user"]["id"]), True),
+            ("Channel", event.interaction["channel"]["name"], True),
+            ("Channel ID", str(event.interaction["channel"]["id"]), True),
+            ("Guild ID", str(event.interaction["guild_id"]), True),
+            (
+                "Created At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        if "command" in event.interaction:
+            fields.append(("Command", event.interaction["command"]["name"], True))
+
+        return EventLog(
+            title="Interaction Created",
+            description=f"A new interaction was created by {event.interaction['user']['display_name']}",
+            color=EmbedColor.INFO,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.INTEGRATION, "Delete")
+    async def on_integration_delete(self, event: IntegrationDelete) -> EventLog:
+        fields = [
+            ("Integration ID", str(event.id), True),
+            ("Guild ID", str(event.guild_id), True),
+            (
+                "Application ID",
+                str(event.application_id) if event.application_id else "N/A",
+                True,
+            ),
+            (
+                "Deleted At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title="Integration Deleted",
+            description="An integration has been deleted from the guild",
+            color=EmbedColor.DELETE,
+            fields=tuple(fields),
+        )
+
+    # Event Guild
+
+    @event_handler(EventType.GUILD, "AuditLogEntryCreate")
+    async def on_guild_audit_log_entry_create(
+        self, event: GuildAuditLogEntryCreate
+    ) -> EventLog:
+        entry = event.audit_log_entry
+        fields = [
+            ("Action Type", str(entry.action_type), True),
+            ("Target Type", str(entry.target_type), True),
+            ("User ID", str(entry.user_id), True),
+            ("Target ID", str(entry.target_id), True),
+            ("Guild ID", str(event.guild_id), True),
+            (
+                "Created At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        if entry.changes:
+            changes = []
+            for change in entry.changes:
+                changes.append(f"{change.key}: {change.old_value} → {change.new_value}")
+            fields.append(("Changes", "\n".join(changes), False))
+
+        if entry.reason:
+            fields.append(("Reason", entry.reason, False))
+
+        return EventLog(
+            title="Audit Log Entry Created",
+            description=f"A new audit log entry has been created for action {entry.action_type}",
+            color=EmbedColor.INFO,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.GUILD, "MembersChunk")
+    async def on_guild_members_chunk(self, event: GuildMembersChunk) -> EventLog:
+        fields = [
+            ("Guild", event.guild.name, True),
+            ("Member Count", str(len(event.members)), True),
+            ("Chunk Index", str(event.chunk_index), True),
+            ("Chunk Count", str(event.chunk_count), True),
+            ("Nonce", event.nonce if event.nonce else "None", True),
+            (
+                "Received At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        if event.presences:
+            fields.append(("Presences Count", str(len(event.presences)), True))
+
+        member_samples = [
+            f"{member.display_name} ({member.id})" for member in event.members[:5]
+        ]
+        if member_samples:
+            fields.append(("Sample Members", "\n".join(member_samples), False))
+            if len(event.members) > 5:
+                fields.append(("Note", "Showing first 5 members only", False))
+
+        return EventLog(
+            title="Guild Members Chunk Received",
+            description=f"Received chunk {event.chunk_index + 1}/{event.chunk_count} of members for {event.guild.name}.",
+            color=EmbedColor.INFO,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.GUILD, "Available")
+    async def on_guild_available(self, event: GuildAvailable) -> EventLog:
+        fields = [
+            ("Guild", event.guild.name, True),
+            ("Guild ID", str(event.guild.id), True),
+            (
+                "Member Count",
+                (
+                    str(event.guild.member_count)
+                    if hasattr(event.guild, "member_count")
+                    else "Unknown"
+                ),
+                True,
+            ),
+            (
+                "Available At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title="Guild Available",
+            description=f"The guild {event.guild.name} is now available.",
+            color=EmbedColor.INFO,
+            fields=tuple(fields),
+        )
+
     @event_handler(EventType.GUILD, "Update")
     async def on_guild_update(self, event: GuildUpdate) -> EventLog:
         fields = []
         before = event.before
         after = event.after
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        timestamp = format_timestamp(datetime.now(timezone.utc))
 
         if before.name != after.name:
             fields.append(
-                ("Name Change", f"From: `{before.name}`\nTo: `{after.name}`", True)
+                ("Name Change", f"- From: `{before.name}`\n- To: `{after.name}`", True)
             )
 
         if before.icon != after.icon:
@@ -1666,7 +1478,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Ownership Transfer",
-                    f"From: <@{before._owner_id}>\nTo: <@{after._owner_id}>",
+                    f"- From: <@{before._owner_id}>\n- To: <@{after._owner_id}>",
                     True,
                 )
             )
@@ -1675,7 +1487,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Verification Level",
-                    f"From: {before.verification_level}\nTo: {after.verification_level}",
+                    f"- From: {before.verification_level}\n- To: {after.verification_level}",
                     True,
                 )
             )
@@ -1684,7 +1496,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Content Filter",
-                    f"From: {before.explicit_content_filter}\nTo: {after.explicit_content_filter}",
+                    f"- From: {before.explicit_content_filter}\n- To: {after.explicit_content_filter}",
                     True,
                 )
             )
@@ -1693,7 +1505,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Default Notifications",
-                    f"From: {before.default_message_notifications}\nTo: {after.default_message_notifications}",
+                    f"- From: {before.default_message_notifications}\n- To: {after.default_message_notifications}",
                     True,
                 )
             )
@@ -1701,13 +1513,15 @@ class Statistics(interactions.Extension):
         if before.afk_channel_id != after.afk_channel_id:
             before_afk = str(before.afk_channel_id) if before.afk_channel_id else "None"
             after_afk = str(after.afk_channel_id) if after.afk_channel_id else "None"
-            fields.append(("AFK Channel", f"From: {before_afk}\nTo: {after_afk}", True))
+            fields.append(
+                ("AFK Channel", f"- From: {before_afk}\n- To: {after_afk}", True)
+            )
 
         if before.afk_timeout != after.afk_timeout:
             fields.append(
                 (
                     "AFK Timeout",
-                    f"From: {before.afk_timeout} seconds\nTo: {after.afk_timeout} seconds",
+                    f"- From: {before.afk_timeout} seconds\n- To: {after.afk_timeout} seconds",
                     True,
                 )
             )
@@ -1716,14 +1530,14 @@ class Statistics(interactions.Extension):
             before_sys = before.system_channel.name if before.system_channel else "None"
             after_sys = after.system_channel.name if after.system_channel else "None"
             fields.append(
-                ("System Channel", f"From: {before_sys}\nTo: {after_sys}", True)
+                ("System Channel", f"- From: {before_sys}\n- To: {after_sys}", True)
             )
 
         if before.rules_channel_id != after.rules_channel_id:
             before_rules = before.rules_channel.name if before.rules_channel else "None"
             after_rules = after.rules_channel.name if after.rules_channel else "None"
             fields.append(
-                ("Rules Channel", f"From: {before_rules}\nTo: {after_rules}", True)
+                ("Rules Channel", f"- From: {before_rules}\n- To: {after_rules}", True)
             )
 
         if before.public_updates_channel_id != after.public_updates_channel_id:
@@ -1740,7 +1554,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Public Updates Channel",
-                    f"From: {before_updates}\nTo: {after_updates}",
+                    f"- From: {before_updates}\n- To: {after_updates}",
                     True,
                 )
             )
@@ -1749,7 +1563,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Preferred Locale",
-                    f"From: {before.preferred_locale}\nTo: {after.preferred_locale}",
+                    f"- From: {before.preferred_locale}\n- To: {after.preferred_locale}",
                     True,
                 )
             )
@@ -1758,7 +1572,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Premium Tier",
-                    f"From: Level {before.premium_tier}\nTo: Level {after.premium_tier}",
+                    f"- From: Level {before.premium_tier}\n- To: Level {after.premium_tier}",
                     True,
                 )
             )
@@ -1767,7 +1581,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Boost Count",
-                    f"From: {before.premium_subscription_count} boosts\nTo: {after.premium_subscription_count} boosts",
+                    f"- From: {before.premium_subscription_count} boosts\n- To: {after.premium_subscription_count} boosts",
                     True,
                 )
             )
@@ -1776,7 +1590,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Vanity URL",
-                    f"From: {before.vanity_url_code or 'None'}\nTo: {after.vanity_url_code or 'None'}",
+                    f"- From: {before.vanity_url_code or 'None'}\n- To: {after.vanity_url_code or 'None'}",
                     True,
                 )
             )
@@ -1785,7 +1599,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Description",
-                    f"From: {before.description or 'None'}\nTo: {after.description or 'None'}",
+                    f"- From: {before.description or 'None'}\n- To: {after.description or 'None'}",
                     False,
                 )
             )
@@ -1831,7 +1645,7 @@ class Statistics(interactions.Extension):
                 ),
                 (
                     "Created At",
-                    after.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    format_timestamp(after.created_at),
                     True,
                 ),
                 ("Updated At", timestamp, True),
@@ -1845,7 +1659,8 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
-    def chunk_field_value(self, value: str, chunk_size: int = 1024) -> list[str]:
+    @staticmethod
+    def chunk_field_value(value: str, chunk_size: int = 1024) -> list[str]:
 
         if len(value) <= chunk_size:
             return [value]
@@ -1868,6 +1683,52 @@ class Statistics(interactions.Extension):
             )
             if chunk
         ]
+
+    @event_handler(EventType.GUILD, "Unavailable")
+    async def on_guild_unavailable(self, event: GuildUnavailable) -> EventLog:
+        fields = [
+            ("Guild ID", str(event.guild_id), True),
+            (
+                "Timestamp",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title="Guild Unavailable",
+            description="A guild has become unavailable. This may be due to a server outage.",
+            color=EmbedColor.INFO,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.GUILD, "StickersUpdate")
+    async def on_guild_stickers_update(self, event: GuildStickersUpdate) -> EventLog:
+        fields = [
+            ("Guild ID", str(event.guild_id), True),
+            ("Total Stickers", str(len(event.stickers)), True),
+            (
+                "Updated At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        sticker_details = []
+        for sticker in event.stickers[:5]:
+            sticker_details.append(f"{sticker.name} ({sticker.format_type})")
+
+        if sticker_details:
+            fields.append(("Sticker Details", "\n".join(sticker_details), False))
+            if len(event.stickers) > 5:
+                fields.append(("Note", "Showing first 5 stickers only", False))
+
+        return EventLog(
+            title="Guild Stickers Updated",
+            description=f"The stickers for guild {event.guild_id} have been updated.",
+            color=EmbedColor.UPDATE,
+            fields=tuple(fields),
+        )
 
     @event_handler(EventType.GUILD, "EmojisUpdate")
     async def on_guild_emojis_update(self, event: GuildEmojisUpdate) -> EventLog:
@@ -1968,7 +1829,7 @@ class Statistics(interactions.Extension):
                 ),
                 (
                     "Updated At",
-                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    format_timestamp(datetime.now(timezone.utc)),
                     True,
                 ),
             ]
@@ -1980,6 +1841,8 @@ class Statistics(interactions.Extension):
             color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
+
+    # Event Invite
 
     @event_handler(EventType.INVITE, "Create")
     async def on_invite_create(self, event: InviteCreate) -> EventLog:
@@ -1999,14 +1862,14 @@ class Statistics(interactions.Extension):
                 (
                     "Never"
                     if not event.invite.expires_at
-                    else event.invite.expires_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    else format_timestamp(event.invite.expires_at)
                 ),
                 True,
             ),
             ("Temporary", "Yes" if event.invite.temporary else "No", True),
             (
                 "Created At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2040,7 +1903,7 @@ class Statistics(interactions.Extension):
             ("Guild ID", str(event.invite.guild.id), True),
             (
                 "Deleted At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2054,6 +1917,8 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
+    # Event Ban
+
     @event_handler(EventType.BAN, "Create")
     async def on_ban_create(self, event: BanCreate) -> EventLog:
         fields = [
@@ -2063,14 +1928,14 @@ class Statistics(interactions.Extension):
             ("Bot Account", "Yes" if event.user.bot else "No", True),
             (
                 "Account Created",
-                event.user.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(event.user.created_at),
                 True,
             ),
             ("Server", event.guild.name, True),
             ("Server ID", str(event.guild.id), True),
             (
                 "Banned At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2093,14 +1958,14 @@ class Statistics(interactions.Extension):
             ("Bot Account", "Yes" if event.user.bot else "No", True),
             (
                 "Account Created",
-                event.user.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(event.user.created_at),
                 True,
             ),
             ("Server", event.guild.name, True),
             ("Server ID", str(event.guild.id), True),
             (
                 "Unbanned At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2110,6 +1975,70 @@ class Statistics(interactions.Extension):
             description=(
                 f"{event.user.display_name} ({event.user}) has been unbanned from {event.guild.name}"
             ),
+            color=EmbedColor.CREATE,
+            fields=tuple(fields),
+        )
+
+    # Event Scheduled Event
+
+    @event_handler(EventType.SCHEDULED_EVENT, "UserRemove")
+    async def on_guild_scheduled_event_user_remove(
+        self, event: GuildScheduledEventUserRemove
+    ) -> EventLog:
+        fields = [
+            ("User ID", str(event.user_id), True),
+            ("Event ID", str(event.scheduled_event_id), True),
+            ("Guild ID", str(event.guild_id), True),
+            (
+                "Removed At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        if event.user:
+            fields.append(("Username", event.user.username, True))
+
+        if event.scheduled_event:
+            fields.append(("Event Name", event.scheduled_event.name, True))
+
+        if event.member:
+            fields.append(("Member Name", event.member.display_name, True))
+
+        return EventLog(
+            title="User Removed from Scheduled Event",
+            description="A user has been removed from a scheduled event.",
+            color=EmbedColor.DELETE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.SCHEDULED_EVENT, "UserAdd")
+    async def on_guild_scheduled_event_user_add(
+        self, event: GuildScheduledEventUserAdd
+    ) -> EventLog:
+        fields = [
+            ("User ID", str(event.user_id), True),
+            ("Event ID", str(event.scheduled_event_id), True),
+            ("Guild ID", str(event.guild_id), True),
+            (
+                "Added At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        if event.user:
+            fields.append(("Username", event.user.username, True))
+
+        if event.scheduled_event:
+            fields.append(("Event Name", event.scheduled_event.name, True))
+
+        if event.member:
+            fields.append(("Member Name", event.member.display_name, True))
+
+        return EventLog(
+            title="User Added to Scheduled Event",
+            description="A user has joined a scheduled event.",
             color=EmbedColor.CREATE,
             fields=tuple(fields),
         )
@@ -2147,13 +2076,13 @@ class Statistics(interactions.Extension):
             ),
             (
                 "Start Time",
-                event.scheduled_event.start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(event.scheduled_event.start_time),
                 True,
             ),
             (
                 "End Time",
                 (
-                    event.scheduled_event.end_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    format_timestamp(event.scheduled_event.end_time)
                     if event.scheduled_event.end_time
                     else "Not specified"
                 ),
@@ -2174,7 +2103,7 @@ class Statistics(interactions.Extension):
             ("Description", truncated_desc, False),
             (
                 "Created At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2198,7 +2127,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Name Change",
-                    f"From: `{event.before.name}`\nTo: `{event.after.name}`",
+                    f"- From: `{event.before.name}`\n- To: `{event.after.name}`",
                     True,
                 )
             )
@@ -2215,39 +2144,43 @@ class Statistics(interactions.Extension):
                 else event.after.description or "No description"
             )
             fields.append(
-                ("Description Change", f"From: {before_desc}\nTo: {after_desc}", False)
+                (
+                    "Description Change",
+                    f"- From: {before_desc}\n- To: {after_desc}",
+                    False,
+                )
             )
 
         if event.before and event.before.start_time != event.after.start_time:
             fields.append(
                 (
                     "Start Time Change",
-                    f"From: {event.before.start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-                    f"To: {event.after.start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                    f"- From: {format_timestamp(event.before.start_time)}\n"
+                    f"- To: {format_timestamp(event.after.start_time)}",
                     True,
                 )
             )
 
         if event.before and event.before.end_time != event.after.end_time:
             before_time = (
-                event.before.end_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+                format_timestamp(event.before.end_time)
                 if event.before.end_time
                 else "Not specified"
             )
             after_time = (
-                event.after.end_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+                format_timestamp(event.after.end_time)
                 if event.after.end_time
                 else "Not specified"
             )
             fields.append(
-                ("End Time Change", f"From: {before_time}\nTo: {after_time}", True)
+                ("End Time Change", f"- From: {before_time}\n- To: {after_time}", True)
             )
 
         if event.before and event.before.status != event.after.status:
             fields.append(
                 (
                     "Status Change",
-                    f"From: {event.before.status}\nTo: {event.after.status}",
+                    f"- From: {event.before.status}\n- To: {event.after.status}",
                     True,
                 )
             )
@@ -2260,7 +2193,11 @@ class Statistics(interactions.Extension):
                 event.after._channel_id if event.after._channel_id else "None"
             )
             fields.append(
-                ("Channel Change", f"From: {before_channel}\nTo: {after_channel}", True)
+                (
+                    "Channel Change",
+                    f"- From: {before_channel}\n- To: {after_channel}",
+                    True,
+                )
             )
 
         if (
@@ -2272,7 +2209,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Location Change",
-                    f"From: {event.before.location}\nTo: {event.after.location}",
+                    f"- From: {event.before.location}\n- To: {event.after.location}",
                     True,
                 )
             )
@@ -2281,7 +2218,7 @@ class Statistics(interactions.Extension):
             fields.append(
                 (
                     "Privacy Level Change",
-                    f"From: {event.before.privacy_level}\nTo: {event.after.privacy_level}",
+                    f"- From: {event.before.privacy_level}\n- To: {event.after.privacy_level}",
                     True,
                 )
             )
@@ -2301,7 +2238,7 @@ class Statistics(interactions.Extension):
                 ),
                 (
                     "Updated At",
-                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    format_timestamp(datetime.now(timezone.utc)),
                     True,
                 ),
             ]
@@ -2332,13 +2269,13 @@ class Statistics(interactions.Extension):
             ),
             (
                 "Scheduled Start",
-                event.scheduled_event.start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(event.scheduled_event.start_time),
                 True,
             ),
             (
                 "Scheduled End",
                 (
-                    event.scheduled_event.end_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    format_timestamp(event.scheduled_event.end_time)
                     if event.scheduled_event.end_time
                     else "Not specified"
                 ),
@@ -2381,7 +2318,7 @@ class Statistics(interactions.Extension):
             ),
             (
                 "Deleted At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2392,6 +2329,8 @@ class Statistics(interactions.Extension):
             color=EmbedColor.DELETE,
             fields=tuple(fields),
         )
+
+    # Event Stage Instance
 
     @event_handler(EventType.STAGE_INSTANCE, "Create")
     async def on_stage_instance_create(self, event: StageInstanceCreate) -> EventLog:
@@ -2420,7 +2359,7 @@ class Statistics(interactions.Extension):
             ),
             (
                 "Created At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2473,7 +2412,7 @@ class Statistics(interactions.Extension):
             ),
             (
                 "Updated At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2528,18 +2467,20 @@ class Statistics(interactions.Extension):
             ),
             (
                 "Deleted At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
 
         if hasattr(event, "discoverable_disabled"):
-            fields.append(
-                (
-                    "Was Discoverable",
-                    "No" if event.discoverable_disabled else "Yes",
-                    True,
-                )
+            fields.extend(
+                [
+                    (
+                        "Was Discoverable",
+                        "No" if event.discoverable_disabled else "Yes",
+                        True,
+                    )
+                ]
             )
 
         if hasattr(event, "scheduled_event_id"):
@@ -2552,6 +2493,8 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
+    # Event Webhook
+
     @event_handler(EventType.WEBHOOK, "Update")
     async def on_webhooks_update(self, event: WebhooksUpdate) -> EventLog:
         fields = [
@@ -2559,7 +2502,7 @@ class Statistics(interactions.Extension):
             ("Guild ID", str(event.guild_id), True),
             (
                 "Updated At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2571,76 +2514,242 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
-    @event_handler(EventType.VOICE, "UserMute")
-    async def on_voice_user_mute(self, event: VoiceUserMute) -> EventLog:
-        action = "muted" if event.mute else "unmuted"
-        fields = [
-            ("User", event.author.display_name, True),
-            ("User ID", str(event.author.id), True),
-            ("Channel", event.channel.name, True),
-            ("Channel ID", str(event.channel.id), True),
-            ("Action", action.capitalize(), True),
-            (
-                "Timestamp",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                True,
-            ),
-        ]
+    # Event Thread
+
+    @event_handler(EventType.THREAD, "Update")
+    async def on_thread_update(self, event: ThreadUpdate) -> EventLog:
+        fields = []
+        thread = event.thread
+
+        if hasattr(event, "before"):
+            before = event.before
+            if before.name != thread.name:
+                fields.append(
+                    ("Name Change", f"- From: {before.name}\n- To: {thread.name}", True)
+                )
+
+            if before.archived != thread.archived:
+                fields.append(
+                    (
+                        "Archive Status",
+                        f"{'Archived' if thread.archived else 'Unarchived'}",
+                        True,
+                    )
+                )
+
+            if before.locked != thread.locked:
+                fields.append(
+                    (
+                        "Lock Status",
+                        f"{'Locked' if thread.locked else 'Unlocked'}",
+                        True,
+                    )
+                )
+
+        fields.extend(
+            [
+                ("Thread ID", str(thread.id), True),
+                (
+                    "Parent Channel",
+                    thread.parent_channel.name if thread.parent_channel else "Unknown",
+                    True,
+                ),
+                (
+                    "Updated At",
+                    format_timestamp(datetime.now(timezone.utc)),
+                    True,
+                ),
+            ]
+        )
 
         return EventLog(
-            title=f"User {action.capitalize()} in Voice Channel",
-            description=f"{event.author.display_name} was {action} in voice channel {event.channel.name}.",
+            title="Thread Updated",
+            description=f"Thread {thread.name} has been modified",
             color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
 
-    @event_handler(EventType.VOICE, "UserMove")
-    async def on_voice_user_move(self, event: VoiceUserMove) -> EventLog:
-        guild = event.new_channel.guild if event.new_channel else None
+    @event_handler(EventType.THREAD, "MembersUpdate")
+    async def on_thread_members_update(self, event: ThreadMembersUpdate) -> EventLog:
+        added_members = (
+            [str(member.id) for member in event.added_members]
+            if event.added_members
+            else []
+        )
+        removed_members = (
+            [str(member_id) for member_id in event.removed_member_ids]
+            if event.removed_member_ids
+            else []
+        )
 
         fields = [
-            ("User", event.author.display_name, True),
-            ("User ID", str(event.author.id), True),
-            ("From Channel", event.previous_channel.name, True),
-            ("From Channel ID", str(event.previous_channel.id), True),
-            ("To Channel", event.new_channel.name, True),
-            ("To Channel ID", str(event.new_channel.id), True),
-            ("Guild", guild.name if guild else "Unknown", True),
-            ("Guild ID", str(guild.id) if guild else "Unknown", True),
+            ("Thread ID", str(event.id), True),
+            ("Member Count", str(event.member_count), True),
             (
-                "Moved At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "Added Members",
+                "\n".join(added_members) if added_members else "None",
+                False,
+            ),
+            (
+                "Removed Members",
+                "\n".join(removed_members) if removed_members else "None",
+                False,
+            ),
+            (
+                "Updated At",
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
 
+        thread_name = event.channel.name if event.channel else str(event.id)
         return EventLog(
-            title="User Moved Voice Channels",
-            description=f"{event.author.display_name} was moved from {event.previous_channel.name} to {event.new_channel.name}.",
+            title="Thread Members Updated",
+            description=f"Member list updated for thread {thread_name}",
             color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
 
-    @event_handler(EventType.VOICE, "UserDeafen")
-    async def on_voice_user_deafen(self, event: VoiceUserDeafen) -> EventLog:
-        action = "deafened" if event.deaf else "undeafened"
+    @event_handler(EventType.THREAD, "MemberUpdate")
+    async def on_thread_member_update(self, event: ThreadMemberUpdate) -> EventLog:
         fields = [
-            ("User", event.author.display_name, True),
-            ("User ID", str(event.author.id), True),
-            ("Channel", event.channel.name, True),
-            ("Channel ID", str(event.channel.id), True),
-            ("Action", action.capitalize(), True),
+            ("Thread ID", str(event.thread.id), True),
+            ("Member ID", str(event.member.id), True),
             (
-                "Timestamp",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "Join Timestamp",
+                (
+                    format_timestamp(event.member.joined_at)
+                    if event.member.joined_at
+                    else "Unknown"
+                ),
+                True,
+            ),
+            (
+                "Updated At",
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
 
         return EventLog(
-            title=f"User {action.capitalize()} in Voice Channel",
-            description=f"{event.author.display_name} was {action} in voice channel {event.channel.name}.",
+            title="Thread Member Updated",
+            description=f"Member status updated in thread {event.thread.name}",
             color=EmbedColor.UPDATE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.THREAD, "Delete")
+    async def on_thread_delete(self, event: ThreadDelete) -> EventLog:
+        fields = [
+            ("Thread Name", event.thread.name, True),
+            ("Thread ID", str(event.thread.id), True),
+            (
+                "Parent Channel",
+                (
+                    event.thread.parent_channel.name
+                    if event.thread.parent_channel
+                    else "Unknown"
+                ),
+                True,
+            ),
+            (
+                "Created At",
+                (
+                    format_timestamp(event.thread.created_at)
+                    if event.thread.created_at
+                    else "Unknown"
+                ),
+                True,
+            ),
+            (
+                "Deleted At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+            (
+                "Message Count",
+                (
+                    str(event.thread.message_count)
+                    if event.thread.message_count
+                    else "Unknown"
+                ),
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title="Thread Deleted",
+            description=f"Thread {event.thread.name} has been deleted",
+            color=EmbedColor.DELETE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.THREAD, "Create")
+    async def on_new_thread_create(self, event: NewThreadCreate) -> EventLog:
+        fields = [
+            ("Thread Name", event.thread.name, True),
+            ("Thread ID", str(event.thread.id), True),
+            ("Owner ID", str(event.thread.owner_id), True),
+            ("Parent Channel", event.thread.parent_channel.name, True),
+            ("Parent ID", str(event.thread.parent_id), True),
+            ("Message Count", str(event.thread.message_count), True),
+            ("Member Count", str(event.thread.member_count), True),
+            ("Archived", "Yes" if event.thread.archived else "No", True),
+            ("Locked", "Yes" if event.thread.locked else "No", True),
+            ("Invitable", "Yes" if event.thread.invitable else "No", True),
+            (
+                "Created At",
+                (
+                    format_timestamp(event.thread.created_at)
+                    if event.thread.created_at
+                    else "Unknown"
+                ),
+                True,
+            ),
+        ]
+
+        if event.thread.auto_archive_duration:
+            fields.append(
+                ("Auto Archive", f"{event.thread.auto_archive_duration}m", True)
+            )
+
+        return EventLog(
+            title="New Thread Created",
+            description=f"A new thread `{event.thread.name}` has been created",
+            color=EmbedColor.CREATE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.THREAD, "Create")
+    async def on_thread_create(self, event: ThreadCreate) -> EventLog:
+        fields = [
+            ("Thread Name", event.thread.name, True),
+            ("Thread ID", str(event.thread.id), True),
+            (
+                "Parent Channel",
+                (
+                    event.thread.parent_channel.name
+                    if event.thread.parent_channel
+                    else "Unknown"
+                ),
+                True,
+            ),
+            (
+                "Created At",
+                format_timestamp(event.thread.created_at),
+                True,
+            ),
+            (
+                "Auto Archive Duration",
+                f"{event.thread.auto_archive_duration} minutes",
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title="Thread Created",
+            description=f"New thread {event.thread.name} has been created",
+            color=EmbedColor.CREATE,
             fields=tuple(fields),
         )
 
@@ -2652,7 +2761,7 @@ class Statistics(interactions.Extension):
             ("Affected Channels", str(len(event.channel_ids)), True),
             (
                 "Synced At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2677,6 +2786,62 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
+    # Event Message
+
+    @event_handler(EventType.MESSAGE, "ReactionRemoveAll")
+    async def on_message_reaction_remove_all(
+        self, event: MessageReactionRemoveAll
+    ) -> EventLog:
+        fields = [
+            ("Message ID", str(event.message.id), True),
+            ("Channel", event.message.channel.name, True),
+            ("Channel ID", str(event.message.channel.id), True),
+            (
+                "Author",
+                (
+                    event.message.author.display_name
+                    if event.message.author
+                    else "Unknown"
+                ),
+                True,
+            ),
+            (
+                "Cleared At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title="All Reactions Removed",
+            description="All reactions have been removed from a message",
+            color=EmbedColor.DELETE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.MESSAGE, "ReactionRemoveEmoji")
+    async def on_message_reaction_remove_emoji(
+        self, event: MessageReactionRemoveEmoji
+    ) -> EventLog:
+        fields = [
+            ("Message ID", str(event.message.id), True),
+            ("Channel ID", str(event.message.channel.id), True),
+            ("Emoji", str(event.emoji), True),
+            ("Guild ID", str(event.guild_id), True),
+            (
+                "Removed At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title="Emoji Reaction Removed",
+            description=f"All instances of {event.emoji} reaction have been removed",
+            color=EmbedColor.DELETE,
+            fields=tuple(fields),
+        )
+
     @event_handler(EventType.MESSAGE, "DeleteBulk")
     async def on_message_delete_bulk(self, event: MessageDeleteBulk) -> EventLog:
         fields = [
@@ -2685,7 +2850,7 @@ class Statistics(interactions.Extension):
             ("Guild ID", str(event.guild_id), True),
             (
                 "Deleted At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
             (
@@ -2703,174 +2868,7 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
-    @event_handler(EventType.GUILD, "Unavailable")
-    async def on_guild_unavailable(self, event: GuildUnavailable) -> EventLog:
-        fields = [
-            ("Guild ID", str(event.guild_id), True),
-            (
-                "Timestamp",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                True,
-            ),
-        ]
-
-        return EventLog(
-            title="Guild Unavailable",
-            description="A guild has become unavailable. This may be due to a server outage.",
-            color=EmbedColor.INFO,
-            fields=tuple(fields),
-        )
-
-    @event_handler(EventType.GUILD, "StickersUpdate")
-    async def on_guild_stickers_update(self, event: GuildStickersUpdate) -> EventLog:
-        fields = [
-            ("Guild ID", str(event.guild_id), True),
-            ("Total Stickers", str(len(event.stickers)), True),
-            (
-                "Updated At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                True,
-            ),
-        ]
-
-        sticker_details = []
-        for sticker in event.stickers[:5]:
-            sticker_details.append(f"{sticker.name} ({sticker.format_type})")
-
-        if sticker_details:
-            fields.append(("Sticker Details", "\n".join(sticker_details), False))
-            if len(event.stickers) > 5:
-                fields.append(("Note", "Showing first 5 stickers only", False))
-
-        return EventLog(
-            title="Guild Stickers Updated",
-            description=f"The stickers for guild {event.guild_id} have been updated.",
-            color=EmbedColor.UPDATE,
-            fields=tuple(fields),
-        )
-
-    @event_handler(EventType.SCHEDULED_EVENT, "UserRemove")
-    async def on_guild_scheduled_event_user_remove(
-        self, event: GuildScheduledEventUserRemove
-    ) -> EventLog:
-        fields = [
-            ("User ID", str(event.user_id), True),
-            ("Event ID", str(event.scheduled_event_id), True),
-            ("Guild ID", str(event.guild_id), True),
-            (
-                "Removed At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                True,
-            ),
-        ]
-
-        if event.user:
-            fields.append(("Username", event.user.username, True))
-
-        if event.scheduled_event:
-            fields.append(("Event Name", event.scheduled_event.name, True))
-
-        if event.member:
-            fields.append(("Member Name", event.member.display_name, True))
-
-        return EventLog(
-            title="User Removed from Scheduled Event",
-            description="A user has been removed from a scheduled event.",
-            color=EmbedColor.DELETE,
-            fields=tuple(fields),
-        )
-
-    @event_handler(EventType.SCHEDULED_EVENT, "UserAdd")
-    async def on_guild_scheduled_event_user_add(
-        self, event: GuildScheduledEventUserAdd
-    ) -> EventLog:
-        fields = [
-            ("User ID", str(event.user_id), True),
-            ("Event ID", str(event.scheduled_event_id), True),
-            ("Guild ID", str(event.guild_id), True),
-            (
-                "Added At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                True,
-            ),
-        ]
-
-        if event.user:
-            fields.append(("Username", event.user.username, True))
-
-        if event.scheduled_event:
-            fields.append(("Event Name", event.scheduled_event.name, True))
-
-        if event.member:
-            fields.append(("Member Name", event.member.display_name, True))
-
-        return EventLog(
-            title="User Added to Scheduled Event",
-            description="A user has joined a scheduled event.",
-            color=EmbedColor.CREATE,
-            fields=tuple(fields),
-        )
-
-    @event_handler(EventType.GUILD, "MembersChunk")
-    async def on_guild_members_chunk(self, event: GuildMembersChunk) -> EventLog:
-        fields = [
-            ("Guild", event.guild.name, True),
-            ("Member Count", str(len(event.members)), True),
-            ("Chunk Index", str(event.chunk_index), True),
-            ("Chunk Count", str(event.chunk_count), True),
-            ("Nonce", event.nonce if event.nonce else "None", True),
-            (
-                "Received At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                True,
-            ),
-        ]
-
-        if event.presences:
-            fields.append(("Presences Count", str(len(event.presences)), True))
-
-        member_samples = [
-            f"{member.display_name} ({member.id})" for member in event.members[:5]
-        ]
-        if member_samples:
-            fields.append(("Sample Members", "\n".join(member_samples), False))
-            if len(event.members) > 5:
-                fields.append(("Note", "Showing first 5 members only", False))
-
-        return EventLog(
-            title="Guild Members Chunk Received",
-            description=f"Received chunk {event.chunk_index + 1}/{event.chunk_count} of members for {event.guild.name}.",
-            color=EmbedColor.INFO,
-            fields=tuple(fields),
-        )
-
-    @event_handler(EventType.GUILD, "Available")
-    async def on_guild_available(self, event: GuildAvailable) -> EventLog:
-        fields = [
-            ("Guild", event.guild.name, True),
-            ("Guild ID", str(event.guild.id), True),
-            (
-                "Member Count",
-                (
-                    str(event.guild.member_count)
-                    if hasattr(event.guild, "member_count")
-                    else "Unknown"
-                ),
-                True,
-            ),
-            (
-                "Available At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                True,
-            ),
-        ]
-
-        return EventLog(
-            title="Guild Available",
-            description=f"The guild {event.guild.name} is now available.",
-            color=EmbedColor.INFO,
-            fields=tuple(fields),
-        )
+    # Event Entitlement
 
     @event_handler(EventType.ENTITLEMENT, "Update")
     async def on_entitlement_update(self, event: EntitlementUpdate) -> EventLog:
@@ -2902,7 +2900,7 @@ class Statistics(interactions.Extension):
             ),
             (
                 "Updated At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2944,7 +2942,7 @@ class Statistics(interactions.Extension):
             ),
             (
                 "Deleted At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2986,7 +2984,7 @@ class Statistics(interactions.Extension):
             ),
             (
                 "Created At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -2995,6 +2993,162 @@ class Statistics(interactions.Extension):
             title="Entitlement Created",
             description="A new entitlement has been created.",
             color=EmbedColor.CREATE,
+            fields=tuple(fields),
+        )
+
+    # Event AutoMod
+
+    @event_handler(EventType.AUTOMOD, "Create")
+    async def on_automod_create(self, event: AutoModCreated) -> EventLog:
+        fields = [
+            ("Rule Name", event.rule.name, True),
+            ("Rule ID", str(event.rule.id), True),
+            ("Creator ID", str(event.rule._creator_id), True),
+            ("Event Type", str(event.rule.event_type), True),
+            ("Trigger Type", str(event.rule.trigger), True),
+            ("Enabled", "Yes" if event.rule.enabled else "No", True),
+            ("Guild ID", str(event.rule._guild_id), True),
+            (
+                "Created At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        if event.rule.exempt_roles:
+            fields.append(
+                (
+                    "Exempt Roles",
+                    ", ".join(f"<@&{role_id}>" for role_id in event.rule.exempt_roles),
+                    False,
+                )
+            )
+
+        if event.rule.exempt_channels:
+            fields.append(
+                (
+                    "Exempt Channels",
+                    ", ".join(
+                        f"<#{channel_id}>" for channel_id in event.rule.exempt_channels
+                    ),
+                    False,
+                )
+            )
+
+        if event.rule.actions:
+            fields.append(
+                (
+                    "Actions",
+                    "\n".join(str(action) for action in event.rule.actions),
+                    False,
+                )
+            )
+
+        return EventLog(
+            title="AutoMod Rule Created",
+            description=f"A new AutoMod rule `{event.rule.name}` has been created",
+            color=EmbedColor.CREATE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.AUTOMOD, "Delete")
+    async def on_automod_delete(self, event: AutoModDeleted) -> EventLog:
+        fields = [
+            ("Rule Name", event.rule.name, True),
+            ("Rule ID", str(event.rule.id), True),
+            ("Creator ID", str(event.rule._creator_id), True),
+            ("Event Type", str(event.rule.event_type), True),
+            ("Trigger Type", str(event.rule.trigger), True),
+            ("Guild ID", str(event.rule._guild_id), True),
+            (
+                "Deleted At",
+                format_timestamp(datetime.now(timezone.utc)),
+                True,
+            ),
+        ]
+
+        return EventLog(
+            title="AutoMod Rule Deleted",
+            description=f"AutoMod rule `{event.rule.name}` has been deleted",
+            color=EmbedColor.DELETE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.AUTOMOD, "Update")
+    async def on_automod_update(self, event: AutoModUpdated) -> EventLog:
+        fields = []
+        before = event.rule
+        after = event.rule
+
+        if before.name != after.name:
+            fields.append(
+                ("Name Change", f"- From: `{before.name}`\n- To: `{after.name}`", True)
+            )
+
+        if before.enabled != after.enabled:
+            fields.append(
+                (
+                    "Status Change",
+                    f"- From: {'Enabled' if before.enabled else 'Disabled'}\n- To: {'Enabled' if after.enabled else 'Disabled'}",
+                    True,
+                )
+            )
+
+        if before.event_type != after.event_type:
+            fields.append(
+                (
+                    "Event Type Change",
+                    f"- From: {before.event_type}\n- To: {after.event_type}",
+                    True,
+                )
+            )
+
+        if before.exempt_roles != after.exempt_roles:
+            fields.append(
+                (
+                    "Exempt Roles Change",
+                    f"- From: {', '.join(f'<@&{role_id}>' for role_id in before.exempt_roles)}\n"
+                    f"- To: {', '.join(f'<@&{role_id}>' for role_id in after.exempt_roles)}",
+                    False,
+                )
+            )
+
+        if before.exempt_channels != after.exempt_channels:
+            fields.append(
+                (
+                    "Exempt Channels Change",
+                    f"- From: {', '.join(f'<#{channel_id}>' for channel_id in before.exempt_channels)}\n"
+                    f"- To: {', '.join(f'<#{channel_id}>' for channel_id in after.exempt_channels)}",
+                    False,
+                )
+            )
+
+        if before.actions != after.actions:
+            fields.append(
+                (
+                    "Actions Change",
+                    f"- From: {', '.join(str(action) for action in before.actions)}\n"
+                    f"- To: {', '.join(str(action) for action in after.actions)}",
+                    False,
+                )
+            )
+
+        fields.extend(
+            [
+                ("Rule ID", str(after.id), True),
+                ("Guild ID", str(after._guild_id), True),
+                (
+                    "Updated At",
+                    format_timestamp(datetime.now(timezone.utc)),
+                    True,
+                ),
+            ]
+        )
+
+        return EventLog(
+            title="AutoMod Rule Updated",
+            description=f"AutoMod rule `{before.name}` has been modified",
+            color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
 
@@ -3065,7 +3219,7 @@ class Statistics(interactions.Extension):
             ),
             (
                 "Executed At",
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                format_timestamp(datetime.now(timezone.utc)),
                 True,
             ),
         ]
@@ -3074,5 +3228,197 @@ class Statistics(interactions.Extension):
             title="AutoMod Action Executed",
             description=f"AutoMod has executed a {event.execution.action} action based on rule trigger: {event.execution.rule_trigger_type}",
             color=EmbedColor.INFO,
+            fields=tuple(fields),
+        )
+
+    # Event Presence
+
+    @event_handler(EventType.PRESENCE, "Update")
+    async def on_presence_update(self, event: PresenceUpdate) -> EventLog:
+        fields = []
+
+        fields.extend(
+            [
+                (
+                    "User",
+                    event.user.display_name if event.user else "Unknown",
+                    True,
+                ),
+                (
+                    "User ID",
+                    str(event.user.id) if event.user else "Unknown",
+                    True,
+                ),
+                (
+                    "Status",
+                    event.status,
+                    True,
+                ),
+                (
+                    "Activities",
+                    ", ".join(activity.name for activity in event.activities) or "None",
+                    True,
+                ),
+                (
+                    "Client Status",
+                    ", ".join(
+                        f"{platform}: {status}"
+                        for platform, status in event.client_status.items()
+                    )
+                    or "None",
+                    True,
+                ),
+                (
+                    "Guild ID",
+                    str(event.guild_id),
+                    True,
+                ),
+                (
+                    "Updated At",
+                    format_timestamp(datetime.now(timezone.utc)),
+                    True,
+                ),
+            ]
+        )
+
+        return EventLog(
+            title="Presence Updated",
+            description="User presence has been updated",
+            color=EmbedColor.UPDATE,
+            fields=tuple(fields),
+        )
+
+    # Event Member
+
+    @event_handler(EventType.MEMBER, "Add")
+    async def on_member_add(self, event: MemberAdd) -> EventLog:
+        fields = [
+            ("Member", event.member.display_name, True),
+            ("User ID", str(event.member.id), True),
+            ("Bot Account", "Yes" if event.member.bot else "No", True),
+            ("Guild", event.member.guild.name, True),
+            ("Guild ID", str(event.member.guild.id), True),
+            (
+                "Account Created",
+                format_timestamp(event.member.created_at),
+                True,
+            ),
+            (
+                "Joined At",
+                format_timestamp(event.member.joined_at),
+                True,
+            ),
+            (
+                "Assigned Roles",
+                (
+                    ", ".join(f"@{role.name}" for role in event.member.roles)
+                    if event.member.roles
+                    else "None"
+                ),
+                False,
+            ),
+        ]
+
+        return EventLog(
+            title="Member Joined",
+            description=f"{event.member.display_name} has joined {event.member.guild.name}",
+            color=EmbedColor.CREATE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.MEMBER, "Remove")
+    async def on_member_remove(self, event: MemberRemove) -> EventLog:
+        fields = [
+            ("Member", event.member.display_name, True),
+            ("User ID", str(event.member.id), True),
+            ("Bot Account", "Yes" if event.member.bot else "No", True),
+            ("Guild", event.member.guild.name, True),
+            ("Guild ID", str(event.member.guild.id), True),
+            (
+                "Account Created",
+                format_timestamp(event.member.created_at),
+                True,
+            ),
+            (
+                "Joined At",
+                format_timestamp(event.member.joined_at),
+                True,
+            ),
+            (
+                "Previous Roles",
+                (
+                    ", ".join(f"@{role.name}" for role in event.member.roles)
+                    if event.member.roles
+                    else "None"
+                ),
+                False,
+            ),
+        ]
+
+        return EventLog(
+            title="Member Left",
+            description=f"{event.member.display_name} has left {event.member.guild.name}",
+            color=EmbedColor.DELETE,
+            fields=tuple(fields),
+        )
+
+    @event_handler(EventType.MEMBER, "Update")
+    async def on_member_update(self, event: MemberUpdate) -> EventLog:
+        fields = []
+        before = event.before
+        after = event.after
+
+        if before.nick != after.nick:
+            fields.append(
+                (
+                    "Nickname Change",
+                    f"- From: {before.nick or 'None'}\n- To: {after.nick or 'None'}",
+                    True,
+                )
+            )
+
+        if before.roles != after.roles:
+            added_roles = set(after.roles) - set(before.roles)
+            removed_roles = set(before.roles) - set(after.roles)
+
+            if added_roles:
+                fields.append(
+                    ("Added Roles", ", ".join(role.name for role in added_roles), True)
+                )
+            if removed_roles:
+                fields.append(
+                    (
+                        "Removed Roles",
+                        ", ".join(role.name for role in removed_roles),
+                        True,
+                    )
+                )
+
+        if before.communication_disabled_until != after.communication_disabled_until:
+            fields.append(
+                (
+                    "Timeout Status",
+                    f"- From: {before.communication_disabled_until or 'None'}\n- To: {after.communication_disabled_until or 'None'}",
+                    True,
+                )
+            )
+
+        fields.extend(
+            [
+                ("Member", after.display_name, True),
+                ("User ID", str(after.id), True),
+                ("Guild", after.guild.name, True),
+                (
+                    "Updated At",
+                    format_timestamp(datetime.now(timezone.utc)),
+                    True,
+                ),
+            ]
+        )
+
+        return EventLog(
+            title="Member Updated",
+            description=f"Member {after.display_name} has been updated",
+            color=EmbedColor.UPDATE,
             fields=tuple(fields),
         )
