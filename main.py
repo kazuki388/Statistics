@@ -2597,74 +2597,74 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
-    @event_handler(EventType.THREAD, "MembersUpdate")
-    async def on_thread_members_update(self, event: ThreadMembersUpdate) -> EventLog:
-        added_members = (
-            [str(member.id) for member in event.added_members]
-            if event.added_members
-            else []
-        )
-        removed_members = (
-            [str(member_id) for member_id in event.removed_member_ids]
-            if event.removed_member_ids
-            else []
-        )
+    # @event_handler(EventType.THREAD, "MembersUpdate")
+    # async def on_thread_members_update(self, event: ThreadMembersUpdate) -> EventLog:
+    #     added_members = (
+    #         [str(member.id) for member in event.added_members]
+    #         if event.added_members
+    #         else []
+    #     )
+    #     removed_members = (
+    #         [str(member_id) for member_id in event.removed_member_ids]
+    #         if event.removed_member_ids
+    #         else []
+    #     )
 
-        fields = [
-            ("Thread ID", str(event.id), True),
-            ("Member Count", str(event.member_count), True),
-            (
-                "Added Members",
-                "\n".join(added_members) if added_members else "None",
-                False,
-            ),
-            (
-                "Removed Members",
-                "\n".join(removed_members) if removed_members else "None",
-                False,
-            ),
-            (
-                "Updated At",
-                format_timestamp(datetime.now(timezone.utc)),
-                True,
-            ),
-        ]
+    #     fields = [
+    #         ("Thread ID", str(event.id), True),
+    #         ("Member Count", str(event.member_count), True),
+    #         (
+    #             "Added Members",
+    #             "\n".join(added_members) if added_members else "None",
+    #             False,
+    #         ),
+    #         (
+    #             "Removed Members",
+    #             "\n".join(removed_members) if removed_members else "None",
+    #             False,
+    #         ),
+    #         (
+    #             "Updated At",
+    #             format_timestamp(datetime.now(timezone.utc)),
+    #             True,
+    #         ),
+    #     ]
 
-        thread_name = event.channel.name if event.channel else str(event.id)
-        return EventLog(
-            title="Thread Members Updated",
-            description=f"Member list updated for thread {thread_name}",
-            color=EmbedColor.UPDATE,
-            fields=tuple(fields),
-        )
+    #     thread_name = event.channel.name if event.channel else str(event.id)
+    #     return EventLog(
+    #         title="Thread Members Updated",
+    #         description=f"Member list updated for thread {thread_name}",
+    #         color=EmbedColor.UPDATE,
+    #         fields=tuple(fields),
+    #     )
 
-    @event_handler(EventType.THREAD, "MemberUpdate")
-    async def on_thread_member_update(self, event: ThreadMemberUpdate) -> EventLog:
-        fields = [
-            ("Thread ID", str(event.thread.id), True),
-            ("Member ID", str(event.member.id), True),
-            (
-                "Join Timestamp",
-                (
-                    format_timestamp(event.member.joined_at)
-                    if event.member.joined_at
-                    else "Unknown"
-                ),
-                True,
-            ),
-            (
-                "Updated At",
-                format_timestamp(datetime.now(timezone.utc)),
-                True,
-            ),
-        ]
+    # @event_handler(EventType.THREAD, "MemberUpdate")
+    # async def on_thread_member_update(self, event: ThreadMemberUpdate) -> EventLog:
+    #     fields = [
+    #         ("Thread ID", str(event.thread.id), True),
+    #         ("Member ID", str(event.member.id), True),
+    #         (
+    #             "Join Timestamp",
+    #             (
+    #                 format_timestamp(event.member.joined_at)
+    #                 if event.member.joined_at
+    #                 else "Unknown"
+    #             ),
+    #             True,
+    #         ),
+    #         (
+    #             "Updated At",
+    #             format_timestamp(datetime.now(timezone.utc)),
+    #             True,
+    #         ),
+    #     ]
 
-        return EventLog(
-            title="Thread Member Updated",
-            description=f"Member status updated in thread {event.thread.name}",
-            color=EmbedColor.UPDATE,
-            fields=tuple(fields),
-        )
+    #     return EventLog(
+    #         title="Thread Member Updated",
+    #         description=f"Member status updated in thread {event.thread.name}",
+    #         color=EmbedColor.UPDATE,
+    #         fields=tuple(fields),
+    #     )
 
     @event_handler(EventType.THREAD, "Delete")
     async def on_thread_delete(self, event: ThreadDelete) -> EventLog:
@@ -3260,60 +3260,60 @@ class Statistics(interactions.Extension):
 
     # Event Presence
 
-    @event_handler(EventType.PRESENCE, "Update")
-    async def on_presence_update(self, event: PresenceUpdate) -> EventLog:
-        fields = []
+    # @event_handler(EventType.PRESENCE, "Update")
+    # async def on_presence_update(self, event: PresenceUpdate) -> EventLog:
+    #     fields = []
 
-        fields.extend(
-            [
-                (
-                    "User",
-                    event.user.display_name if event.user else "Unknown",
-                    True,
-                ),
-                (
-                    "User ID",
-                    str(event.user.id) if event.user else "Unknown",
-                    True,
-                ),
-                (
-                    "Status",
-                    event.status,
-                    True,
-                ),
-                (
-                    "Activities",
-                    ", ".join(activity.name for activity in event.activities) or "None",
-                    True,
-                ),
-                (
-                    "Client Status",
-                    ", ".join(
-                        f"{platform}: {status}"
-                        for platform, status in event.client_status.items()
-                    )
-                    or "None",
-                    True,
-                ),
-                (
-                    "Guild ID",
-                    str(event.guild_id),
-                    True,
-                ),
-                (
-                    "Updated At",
-                    format_timestamp(datetime.now(timezone.utc)),
-                    True,
-                ),
-            ]
-        )
+    #     fields.extend(
+    #         [
+    #             (
+    #                 "User",
+    #                 event.user.display_name if event.user else "Unknown",
+    #                 True,
+    #             ),
+    #             (
+    #                 "User ID",
+    #                 str(event.user.id) if event.user else "Unknown",
+    #                 True,
+    #             ),
+    #             (
+    #                 "Status",
+    #                 event.status,
+    #                 True,
+    #             ),
+    #             (
+    #                 "Activities",
+    #                 ", ".join(activity.name for activity in event.activities) or "None",
+    #                 True,
+    #             ),
+    #             (
+    #                 "Client Status",
+    #                 ", ".join(
+    #                     f"{platform}: {status}"
+    #                     for platform, status in event.client_status.items()
+    #                 )
+    #                 or "None",
+    #                 True,
+    #             ),
+    #             (
+    #                 "Guild ID",
+    #                 str(event.guild_id),
+    #                 True,
+    #             ),
+    #             (
+    #                 "Updated At",
+    #                 format_timestamp(datetime.now(timezone.utc)),
+    #                 True,
+    #             ),
+    #         ]
+    #     )
 
-        return EventLog(
-            title="Presence Updated",
-            description="User presence has been updated",
-            color=EmbedColor.UPDATE,
-            fields=tuple(fields),
-        )
+    #     return EventLog(
+    #         title="Presence Updated",
+    #         description="User presence has been updated",
+    #         color=EmbedColor.UPDATE,
+    #         fields=tuple(fields),
+    #     )
 
     # Event Member
 
