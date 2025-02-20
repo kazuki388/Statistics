@@ -134,7 +134,11 @@ class EventLog:
     title: str
     description: str
     color: EmbedColor
-    fields: tuple[tuple[str, Any, bool], ...]
+    author: Optional[str] = None
+    author_icon: Optional[str] = None
+    footer: Optional[str] = None
+    footer_icon: Optional[str] = None
+    fields: tuple[tuple[str, Any, bool], ...] = ()
 
 
 class EventType(IntEnum):
@@ -342,6 +346,19 @@ def create_embed(event_log: EventLog) -> interactions.Embed:
         title=event_log.title,
         description=event_log.description,
         color=event_log.color.value,
+        author=(
+            {"name": event_log.author, "icon_url": event_log.author_icon}
+            if event_log.author and event_log.author_icon
+            else None
+        ),
+        footer=(
+            {
+                "text": event_log.footer,
+                "icon_url": event_log.footer_icon,
+            }
+            if event_log.footer and event_log.footer_icon
+            else None
+        ),
         timestamp=interactions.Timestamp.now(timezone.utc),
         fields=[
             interactions.EmbedField(
@@ -2712,73 +2729,73 @@ class Statistics(interactions.Extension):
             fields=tuple(fields),
         )
 
-    @event_handler(EventType.THREAD, "Create")
-    async def on_new_thread_create(self, event: NewThreadCreate) -> EventLog:
-        fields = [
-            ("Thread Name", event.thread.name, True),
-            ("Thread ID", str(event.thread.id), True),
-            ("Owner ID", str(event.thread.owner_id), True),
-            ("Parent Channel", event.thread.parent_channel.name, True),
-            ("Parent ID", str(event.thread.parent_id), True),
-            ("Message Count", str(event.thread.message_count), True),
-            ("Member Count", str(event.thread.member_count), True),
-            ("Archived", "Yes" if event.thread.archived else "No", True),
-            ("Locked", "Yes" if event.thread.locked else "No", True),
-            (
-                "Created At",
-                (
-                    format_timestamp(event.thread.created_at)
-                    if event.thread.created_at
-                    else "Unknown"
-                ),
-                True,
-            ),
-        ]
+    # @event_handler(EventType.THREAD, "Create")
+    # async def on_new_thread_create(self, event: NewThreadCreate) -> EventLog:
+    #     fields = [
+    #         ("Thread Name", event.thread.name, True),
+    #         ("Thread ID", str(event.thread.id), True),
+    #         ("Owner ID", str(event.thread.owner_id), True),
+    #         ("Parent Channel", event.thread.parent_channel.name, True),
+    #         ("Parent ID", str(event.thread.parent_id), True),
+    #         ("Message Count", str(event.thread.message_count), True),
+    #         ("Member Count", str(event.thread.member_count), True),
+    #         ("Archived", "Yes" if event.thread.archived else "No", True),
+    #         ("Locked", "Yes" if event.thread.locked else "No", True),
+    #         (
+    #             "Created At",
+    #             (
+    #                 format_timestamp(event.thread.created_at)
+    #                 if event.thread.created_at
+    #                 else "Unknown"
+    #             ),
+    #             True,
+    #         ),
+    #     ]
 
-        if event.thread.auto_archive_duration:
-            fields.append(
-                ("Auto Archive", f"{event.thread.auto_archive_duration}m", True)
-            )
+    #     if event.thread.auto_archive_duration:
+    #         fields.append(
+    #             ("Auto Archive", f"{event.thread.auto_archive_duration}m", True)
+    #         )
 
-        return EventLog(
-            title="New Thread Created",
-            description=f"A new thread `{event.thread.mention}` has been created",
-            color=EmbedColor.CREATE,
-            fields=tuple(fields),
-        )
+    #     return EventLog(
+    #         title="New Thread Created",
+    #         description=f"A new thread `{event.thread.mention}` has been created",
+    #         color=EmbedColor.CREATE,
+    #         fields=tuple(fields),
+    #     )
 
-    @event_handler(EventType.THREAD, "Create")
-    async def on_thread_create(self, event: ThreadCreate) -> EventLog:
-        fields = [
-            ("Thread Name", event.thread.name, True),
-            ("Thread ID", str(event.thread.id), True),
-            (
-                "Parent Channel",
-                (
-                    event.thread.parent_channel.name
-                    if event.thread.parent_channel
-                    else "Unknown"
-                ),
-                True,
-            ),
-            (
-                "Created At",
-                format_timestamp(event.thread.created_at),
-                True,
-            ),
-            (
-                "Auto Archive Duration",
-                f"{event.thread.auto_archive_duration} minutes",
-                True,
-            ),
-        ]
+    # @event_handler(EventType.THREAD, "Create")
+    # async def on_thread_create(self, event: ThreadCreate) -> EventLog:
+    #     fields = [
+    #         ("Thread Name", event.thread.name, True),
+    #         ("Thread ID", str(event.thread.id), True),
+    #         (
+    #             "Parent Channel",
+    #             (
+    #                 event.thread.parent_channel.name
+    #                 if event.thread.parent_channel
+    #                 else "Unknown"
+    #             ),
+    #             True,
+    #         ),
+    #         (
+    #             "Created At",
+    #             format_timestamp(event.thread.created_at),
+    #             True,
+    #         ),
+    #         (
+    #             "Auto Archive Duration",
+    #             f"{event.thread.auto_archive_duration} minutes",
+    #             True,
+    #         ),
+    #     ]
 
-        return EventLog(
-            title="Thread Created",
-            description=f"New thread {event.thread.mention} has been created",
-            color=EmbedColor.CREATE,
-            fields=tuple(fields),
-        )
+    #     return EventLog(
+    #         title="Thread Created",
+    #         description=f"New thread {event.thread.mention} has been created",
+    #         color=EmbedColor.CREATE,
+    #         fields=tuple(fields),
+    #     )
 
     @event_handler(EventType.THREAD, "ListSync")
     async def on_thread_list_sync(self, event: ThreadListSync) -> EventLog:
@@ -3320,7 +3337,7 @@ class Statistics(interactions.Extension):
     @event_handler(EventType.MEMBER, "Add")
     async def on_member_add(self, event: MemberAdd) -> EventLog:
         fields = [
-            ("Member", event.member.mention, True),
+            ("Member", event.member.display_name, True),
             ("User ID", str(event.member.id), True),
             ("Bot Account", "Yes" if event.member.bot else "No", True),
             ("Guild", event.member.guild.name, True),
@@ -3349,6 +3366,12 @@ class Statistics(interactions.Extension):
         return EventLog(
             title="Member Joined",
             description=f"{event.member.mention} has joined {event.member.guild.name}",
+            author=event.member.display_name if event.member.display_name else None,
+            author_icon=event.member.avatar_url if event.member.avatar_url else None,
+            footer=event.member.guild.name if event.member.guild.name else None,
+            footer_icon=(
+                event.member.guild.icon.url if event.member.guild.icon.url else None
+            ),
             color=EmbedColor.CREATE,
             fields=tuple(fields),
         )
@@ -3356,7 +3379,7 @@ class Statistics(interactions.Extension):
     @event_handler(EventType.MEMBER, "Remove")
     async def on_member_remove(self, event: MemberRemove) -> EventLog:
         fields = [
-            ("Member", event.member.mention, True),
+            ("Member", event.member.display_name, True),
             ("User ID", str(event.member.id), True),
             ("Bot Account", "Yes" if event.member.bot else "No", True),
             ("Guild", event.member.guild.name, True),
@@ -3385,6 +3408,12 @@ class Statistics(interactions.Extension):
         return EventLog(
             title="Member Left",
             description=f"{event.member.mention} has left {event.member.guild.name}",
+            author=event.member.display_name if event.member.display_name else None,
+            author_icon=event.member.avatar_url if event.member.avatar_url else None,
+            footer=event.member.guild.name if event.member.guild.name else None,
+            footer_icon=(
+                event.member.guild.icon.url if event.member.guild.icon.url else None
+            ),
             color=EmbedColor.DELETE,
             fields=tuple(fields),
         )
